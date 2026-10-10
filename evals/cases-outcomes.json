@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "notes": "Naturalistic refund/retry review. The prompt states the goal only; runner strategy selection is separate from the case.",
+  "cases": [
+    {
+      "id": "refund_retry_review",
+      "expect": "either",
+      "scale": 1,
+      "dataset": "refund_retry",
+      "key": "refund_retry_findings",
+      "prompt": "Review every claim in review/claims.json against the HEAD change and the review materials in review/. For each claim, tell me whether it is factually supported, refuted or underdetermined, what action is warranted under the triage policy, and whether HEAD introduced the behavior the claim describes."
+    }
+  ]
+}

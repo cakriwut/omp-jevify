@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
-"""Trigger and outcome eval for the jevify skill.
+"""Availability and strategy comparison for the jevify skill.
 
-Runs each case in evals/cases.json as a fresh non-interactive `omp` session inside a
-freshly built fixture repository, and records whether the model opened the skill,
-loaded the jv helpers, and ran a judge batch, plus the session's final answer and token
-usage for outcome grading (evals/grade.py). Sessions run to completion, bounded by
---max-time and --max-calls.
-
-A case may set "scale": N to build a larger fixture (default 1; evals/cases-large.json runs
-at scale 12). "expect": "either" cases are controls whose trigger is not scored: they are
-reported as their own `either` count, and their answer is still graded.
+Runs every case as a bounded non-interactive `omp` session in a fresh fixture. `--arm`
+controls whether the product skill is available. `--strategy` independently controls
+how the subject is instructed to work. A goal is never rewritten into an expected
+answer or source string. Sessions run to completion, bounded by --max-time and
+--max-calls, with extensions, rules, LSP and titling disabled identically in every arm.
 
 Arms, each set through a one-shot `--config` overlay for that process only:
-  skill  the skill under test is pinned via skills.customDirectories, overriding any
-         installed jevify plugin.
-  none   jevify is removed via skills.ignoredSkills; every other skill stays available.
-         The jevify magic-keyword notice still fires.
+  skill  the skill under test is pinned via skills.customDirectories as bare jevify;
+         every namespaced jevify copy, such as a displaced installed plugin, is ignored.
+  none   bare and every namespaced jevify skill are ignored via skills.ignoredSkills.
+
+Strategies:
+  auto           the case goal is unchanged.
+  direct-script  compute or inspect directly; no task-driven judge/completion.
+  jev-flat       one flat Jevify judgment per planned unit with the prescribed settings.
+  jev-grouped    grouped Jevify judgments with the prescribed settings.
+
+Cold cache runs get a distinct, initially empty judgment database for every attempt.
+Warm mode freezes an explicit seeded database with a consistent SQLite backup (including
+WAL) once per evaluation, then clones it independently for every attempt. A seed alone
+never proves cache hits. Uncontrolled mode leaves the host cache untouched.
 
   python3 evals/run.py --ref v0.1.0 --out evals/results/baseline-v0.1.0.json
-  python3 evals/run.py --out /tmp/candidate.json --compare evals/results/baseline-v0.1.0.json
-  python3 evals/run.py --arm none --omp /path/to/omp --out /tmp/noskill.json
+  python3 evals/run.py --strategy jev-flat --cache-mode cold --out /tmp/flat.json
+  python3 evals/run.py --arm none --strategy auto --out /tmp/noskill.json
 
 Needs a working `omp` with model access. Results vary run to run; use --reps >= 3.
-Usage sums the main session's assistant messages only; model calls made inside the eval
-kernel (judge/judge_batch) are not included.
+Outer assistant usage and persisted session model_usage entries are kept separately.
+An absent or incomplete session ledger, or an unknown-cost attempt, leaves the monetary total
+unknown; it is never stored as zero. Outer chat costs are catalog estimates. Grading
+cost is not measured or copied into an execution result.
 """
 
 import argparse
@@ -33,11 +41,13 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -46,15 +56,42 @@ sys.path.insert(0, str(HERE))
 import fixture  # noqa: E402
 
 TOOLS = "read,eval,grep,glob,bash,find,edit,write"
+SESSION_FLAGS = ("--no-extensions", "--no-rules", "--no-lsp", "--no-title")
+# Host wire purposes map to stable report buckets; runtime-only purposes remain other.
+TASK_PURPOSES = {"judge": "judgment", "judge_batch": "judgment", "eval_completion": "completion"}
 LIVE = set()  # running omp sessions, reaped if the runner is interrupted
-JUDGE_MARKERS = ("judge_batch", "jv.run(", "judge(")
-AGENT_END_GRACE = 15  # seconds an omp process may linger after agent_end before it is reaped
+SOURCE_MARKERS = ("judge_batch", "jv.run(", "judge(", "completion(")
+STRATEGIES = ("auto", "direct-script", "jev-flat", "jev-grouped")
+JEV_STRATEGIES = ("jev-flat", "jev-grouped")
+CACHE_MODES = ("cold", "warm", "uncontrolled")
+SNAPSHOT_STATES = ("complete", "incomplete", "absent")
+HELPER_CONCURRENCY = 4
+BACKEND_RETRIES = 0
+SHARED_DEADLINE_SECONDS = 60
+GROUPED_K = 4
+PUBLIC_RUBRIC_REL = Path("review/rubric.json")
+PUBLIC_CLAIMS_REL = Path("review/claims.json")
+REQUIRED_SKILL_FILES = ("SKILL.md", "jevify.py")
+TOKEN_FIELDS = {
+    "input": ("input", "inputTokens", "prompt_tokens"),
+    "output": ("output", "outputTokens", "completion_tokens"),
+    "cache_read": ("cache_read", "cacheRead", "cached_tokens"),
+    "cache_write": ("cache_write", "cacheWrite"),
+}
+RESULT_SCHEMA = 4
+
+
+# OMP filters raw skill names before namespacing, then final names afterward. These patterns
+# need a slash, so the pinned bare jevify stays available in the skill arm.
+NAMESPACED_JEVIFY = ("*/**/jevify", "*/**/jevify~*")
 
 
 def overlay_text(arm, skills_dir):
+    ignored = NAMESPACED_JEVIFY if arm == "skill" else ("jevify", *NAMESPACED_JEVIFY)
+    text = "skills:\n"
     if arm == "skill":
-        return f"skills:\n  customDirectories:\n    - {json.dumps(str(skills_dir))}\n"
-    return 'skills:\n  ignoredSkills:\n    - "jevify"\n'
+        text += f"  customDirectories:\n    - {json.dumps(str(skills_dir))}\n"
+    return text + "  ignoredSkills:\n" + "".join(f"    - {json.dumps(pattern)}\n" for pattern in ignored)
 
 
 def message_text(msg):
@@ -66,24 +103,122 @@ def message_text(msg):
     return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
 
 
-def add_usage(total, usage):
+def load_json_object(text):
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def structured_values(value):
+    """Objects in an actual tool result, including JSON printed one object per output line."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from structured_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from structured_values(child)
+    elif isinstance(value, str):
+        whole = load_json_object(value.strip())
+        parsed = [whole] if whole is not None else [load_json_object(line.strip()) for line in value.splitlines()
+                                                     if line.strip().startswith("{")]
+        for item in parsed:
+            if item is not None:
+                yield from structured_values(item)
+
+
+def first_number(record, names):
+    if not isinstance(record, dict):
+        return None
+    for name in names:
+        value = record.get(name)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return value
+    return None
+
+
+def usage_tokens(usage):
+    return {name: first_number(usage, names) for name, names in TOKEN_FIELDS.items()}
+
+
+def usage_reported_cost(usage):
     if not isinstance(usage, dict):
-        return
+        return None
     cost = usage.get("cost")
-    for key, value in (("input", usage.get("input")), ("output", usage.get("output")),
-                       ("cache_read", usage.get("cacheRead")), ("cache_write", usage.get("cacheWrite")),
-                       ("cost", cost.get("total") if isinstance(cost, dict) else cost)):
+    if isinstance(cost, dict):
+        value = cost.get("total")
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        return cost
+    return None
+
+
+def add_usage(total, usage):
+    """Compatibility accumulator for the historical outer-only usage object."""
+    for key, value in usage_tokens(usage).items():
         if isinstance(value, (int, float)):
             total[key] = (total[key] or 0) + value
+    cost = usage_reported_cost(usage)
+    if isinstance(cost, (int, float)):
+        total["cost"] = (total["cost"] or 0) + cost
+
+
+def digest_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def digest_json(value):
+    return digest_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+
+
+def helper_qhash(questions):
+    """The question hash jv.run writes into its receipt (jv.qhash)."""
+    return hashlib.sha256(json.dumps(questions, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def string_ids(value):
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return value
+
+
+def git_text(cwd, *args):
+    result = subprocess.run(["git", *args], cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def git_paths(cwd, *args):
+    result = subprocess.run(["git", *args], cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True)
+    if result.returncode != 0:
+        return None
+    return [part.decode("utf-8", "surrogateescape") for part in result.stdout.split(b"\0") if part]
+
+
+def file_identity(path):
+    path = Path(path)
+    if not path.is_file():
+        return {"path": str(path), "present": False, "sha256": None, "bytes": None}
+    data = path.read_bytes()
+    return {"path": str(path.resolve()), "present": True, "sha256": digest_bytes(data), "bytes": len(data)}
 
 
 def skill_from_ref(ref, dest):
-    target = dest / "jevify"
-    target.mkdir(parents=True)
-    for name in ("SKILL.md", "jevify.py"):
-        blob = subprocess.run(["git", "show", f"{ref}:skills/jevify/{name}"], cwd=ROOT,
-                              check=True, capture_output=True).stdout
-        (target / name).write_bytes(blob)
+    """Materialize every tracked file under skills/jevify at ref, reference material included."""
+    names = git_paths(ROOT, "ls-tree", "-r", "-z", "--name-only", ref, "--", "skills/jevify/")
+    if not names:
+        raise RuntimeError(f"git ref {ref!r} has no skills/jevify directory")
+    for name in names:
+        result = subprocess.run(["git", "show", f"{ref}:{name}"], cwd=ROOT, stdin=subprocess.DEVNULL,
+                                capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"cannot read {name} at {ref!r}")
+        target = dest / "jevify" / Path(name).relative_to("skills/jevify")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(result.stdout)
     return dest
 
 
@@ -94,6 +229,825 @@ def description(skill_md):
         if line.strip() == "---":
             break
     return ""
+
+
+def skill_identity(skills_dir, arm):
+    root = Path(skills_dir) / "jevify"
+    paths = sorted(path for path in root.rglob("*") if path.is_file() and "__pycache__" not in path.parts) \
+        if root.is_dir() else []
+    files = {str(path.relative_to(root)): file_identity(path) for path in paths}
+    return {
+        "available": arm == "skill",
+        "directory": str(root.resolve()) if root.is_dir() else None,
+        "files": files,
+        "materialized_sha256": digest_json({name: record["sha256"] for name, record in files.items()})
+        if arm == "skill" and files else None,
+        "complete": arm != "skill" or all(name in files for name in REQUIRED_SKILL_FILES),
+        "notes": ["File hashes identify the tested bundle; a mixed bundle is not a historical release."],
+    }
+
+
+def source_changes(root):
+    """Working-tree state against HEAD: tracked edits and deletions plus untracked, non-ignored files."""
+    tracked = git_paths(root, "diff", "--name-status", "--no-renames", "-z", "HEAD")
+    untracked = git_paths(root, "ls-files", "--others", "--exclude-standard", "-z")
+    if tracked is None or untracked is None or len(tracked) % 2:
+        return None
+    changes = {}
+    for status, name in zip(tracked[0::2], tracked[1::2]):
+        kind = "deleted" if status.startswith("D") else "added" if status.startswith("A") else "modified"
+        changes[name] = {"status": kind, "sha256": None if kind == "deleted" else file_identity(root / name)["sha256"]}
+    for name in untracked:
+        changes[name] = {"status": "untracked", "sha256": file_identity(root / name)["sha256"]}
+    return dict(sorted(changes.items()))
+
+
+def source_identity(executable, requested_source):
+    executable = Path(executable).resolve()
+    record = file_identity(executable)
+    record["version"] = subprocess.run([str(executable), "--version"], stdin=subprocess.DEVNULL,
+                                       capture_output=True, text=True).stdout.strip() or None
+    if requested_source is None:
+        return {"kind": "executable_only", "status": "source_unspecified", "executable": record,
+                "source_root": None, "revision": None, "changes": None, "source_manifest_sha256": None,
+                "notes": ["The executable version label is not evidence of the source tree it runs."]}
+    root = Path(requested_source).resolve()
+    if not root.is_dir():
+        raise RuntimeError(f"--omp-source does not exist: {root}")
+    revision = git_text(root, "rev-parse", "HEAD")
+    changes = source_changes(root)
+    complete = revision is not None and changes is not None
+    return {
+        "kind": "explicit_source_tree",
+        "status": "complete" if complete else "incomplete",
+        "executable": record,
+        "source_root": str(root),
+        "revision": revision,
+        "changes": changes,
+        "source_manifest_sha256": digest_json({"revision": revision, "changes": changes}) if complete else None,
+        "notes": ["Executable identity and source-tree identity are recorded independently."],
+    }
+
+
+def fixture_identity(case):
+    dataset = case.get("dataset", "billing")
+    with tempfile.TemporaryDirectory(prefix="jevify-fixture-id-") as tmp:
+        repo = fixture.build(Path(tmp) / "repo", scale=case.get("scale", 1), dataset=dataset)
+        files = {}
+        for path in sorted(p for p in repo.rglob("*") if p.is_file() and ".git" not in p.parts):
+            files[str(path.relative_to(repo))] = digest_bytes(path.read_bytes())
+        keys = fixture.answer_keys(repo, dataset=dataset)
+    return {
+        "dataset": dataset,
+        "scale": case.get("scale", 1),
+        "key": case.get("key"),
+        "fixture_sha256": digest_json(files),
+        "private_keys_sha256": digest_json(keys),
+        "public_rubric_sha256": files.get(str(PUBLIC_RUBRIC_REL)),
+        "file_count": len(files),
+    }
+
+
+def public_plan(repo):
+    """Planned unit IDs and the helper hash of the public rubric, read before the session starts."""
+    plan = {"planned_ids": None, "rubric_hash": None}
+    rubric = load_json_object((repo / PUBLIC_RUBRIC_REL).read_text()) if (repo / PUBLIC_RUBRIC_REL).is_file() else None
+    if rubric:
+        plan["rubric_hash"] = helper_qhash(rubric)
+    claims = load_json_object((repo / PUBLIC_CLAIMS_REL).read_text()) if (repo / PUBLIC_CLAIMS_REL).is_file() else None
+    entries = claims.get("claims") if claims else None
+    if isinstance(entries, list):
+        ids = string_ids([entry.get("id") if isinstance(entry, dict) else None for entry in entries])
+        if ids and all(ids) and len(set(ids)) == len(ids):
+            plan["planned_ids"] = ids
+    return plan
+
+
+def public_rubric_obligation(repo):
+    rubric = load_json_object((repo / PUBLIC_RUBRIC_REL).read_text()) if (repo / PUBLIC_RUBRIC_REL).is_file() else None
+    if not rubric:
+        return ""
+    names = ", ".join(sorted(str(name) for name in rubric))
+    return (f" The public rubric is already in {PUBLIC_RUBRIC_REL.as_posix()} with questions {names}. "
+            "Use that rubric unchanged; do not replace, narrow, or reveal its criteria.")
+
+
+def strategy_prompt(case, repo, strategy):
+    goal = case["prompt"].rstrip()
+    if strategy == "auto":
+        return goal
+    if strategy == "direct-script":
+        method = (" Use direct inspection, deterministic tools, or an ordinary script. "
+                  "Do not call judge, judge_batch, completion, or the Jevify helper.")
+    elif strategy == "jev-flat":
+        method = (f" Use the Jevify helper for one flat judgment batch: concurrency={HELPER_CONCURRENCY}, "
+                  f"backend retries={BACKEND_RETRIES}, and a shared deadline of {SHARED_DEADLINE_SECONDS} seconds. "
+                  "Judge each planned unit independently. Keep the returned rows and their rows.receipt. "
+                  "Check rows.receipt['complete'] as well as jv.flag(rows) before closing or acting; "
+                  "manually resolve flagged rows or incomplete coverage.")
+    elif strategy == "jev-grouped":
+        method = (f" Use the Jevify helper with grouped judgments: group size k={GROUPED_K}, "
+                  f"concurrency={HELPER_CONCURRENCY}, backend retries={BACKEND_RETRIES}, and a shared deadline "
+                  f"of {SHARED_DEADLINE_SECONDS} seconds. Cover every planned unit. "
+                  "Use grouped_states, grouping = jv.group(...), then pass grouping=grouping to jv.run; "
+                  "do not pass only the slots or discard exclusions. Keep the returned rows and rows.receipt. "
+                  "Check rows.receipt['complete'] as well as jv.flag(rows) before closing or acting. "
+                  "If calibrating, pass the same grouped_states to jv.calibrate(rows, grouped_states, Q, ...); "
+                  "the helper retains group/slot/shared context. Manually resolve flags and exclusions.")
+    else:
+        raise ValueError(f"unknown strategy {strategy!r}")
+    return goal + method + public_rubric_obligation(repo)
+
+
+def freeze_cache_seed(requested_namespace, workdir):
+    """Freeze once before scheduling jobs; pass this descriptor to warm cache_plan.
+
+    The SQLite backup includes committed WAL contents, unlike copying the seed file.
+    Only the backup is fingerprinted: source identity is not a claim that the live
+    source bytes stay fixed. Invalid input raises ValueError, SQLite failures raise
+    RuntimeError, and filesystem failures propagate as OSError.
+    """
+    if not isinstance(requested_namespace, (str, os.PathLike)) or not str(requested_namespace):
+        raise ValueError("warm cache mode requires --cache-namespace pointing at a seeded database")
+    source = Path(requested_namespace).resolve()
+    if not source.is_file() or source.stat().st_size == 0:
+        raise ValueError(f"warm cache namespace is missing or empty: {source}")
+    identity = source.stat()
+    workdir = Path(workdir).resolve()
+    workdir.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="cache-seed-", dir=workdir))
+    path = directory / "frozen.sqlite"
+    try:
+        reader = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
+        try:
+            writer = sqlite3.connect(path)
+            try:
+                reader.backup(writer)
+            finally:
+                writer.close()
+        finally:
+            reader.close()
+        contents = path.read_bytes()
+        path.chmod(0o444)
+        return {"kind": "frozen_sqlite_seed", "path": path,
+                "initial_sha256": digest_bytes(contents), "initial_bytes": len(contents),
+                "source": {"path": str(source), "device": identity.st_dev, "inode": identity.st_ino},
+                "snapshot": {"method": "sqlite_backup", "source_access": "read_only", "wal_included": True},
+                "isolation": "frozen_seed"}
+    except (sqlite3.Error, OSError) as exc:
+        shutil.rmtree(directory)
+        if isinstance(exc, sqlite3.Error):
+            raise RuntimeError(f"could not freeze warm cache seed {source}: {exc}") from exc
+        raise
+
+
+def _cache_attempt_path(workdir, mode):
+    """Reserve a distinct path even for repeated case/rep/attempt identifiers."""
+    directory = Path(workdir).resolve() / f"{mode}-cache"
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix="attempt-", suffix=".sqlite", dir=directory, delete=False) as db:
+        return Path(db.name)
+
+
+def cache_plan(mode, requested_namespace, workdir, case_id, rep, attempt):
+    """Plan independent writable attempts; warm accepts only a frozen descriptor."""
+    if mode == "uncontrolled":
+        if requested_namespace is not None:
+            raise ValueError("an explicit cache namespace requires cold or warm mode")
+        return {"mode": mode, "status": "uncontrolled", "path": None, "seeded": None,
+                "notes": ["Host cache location and initial contents were intentionally not controlled."]}
+    if mode == "warm":
+        seed = requested_namespace
+        if (not isinstance(seed, dict) or seed.get("kind") != "frozen_sqlite_seed"
+                or not isinstance(seed.get("path"), (str, os.PathLike))
+                or not isinstance(seed.get("initial_sha256"), str)
+                or not isinstance(seed.get("initial_bytes"), int)
+                or not isinstance(seed.get("source"), dict) or not isinstance(seed.get("snapshot"), dict)):
+            raise ValueError("warm cache mode requires a descriptor from freeze_cache_seed")
+        frozen = Path(seed["path"]).resolve()
+        if not frozen.is_relative_to(Path(workdir).resolve()) or not frozen.is_file():
+            raise ValueError("frozen warm cache seed must exist under workdir")
+        path = _cache_attempt_path(workdir, mode)
+        try:
+            # Copy data, not the frozen file's read-only permissions.
+            shutil.copyfile(frozen, path)
+            contents = path.read_bytes()
+            fingerprint = digest_bytes(contents)
+            if fingerprint != seed["initial_sha256"] or len(contents) != seed["initial_bytes"]:
+                raise ValueError("frozen warm cache seed no longer matches its starting fingerprint")
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
+            raise
+        return {"mode": mode, "status": "frozen_seed_clone", "path": path, "seeded": True,
+                "initial_sha256": fingerprint, "initial_bytes": len(contents),
+                "seed_path": str(frozen), "source": seed["source"], "snapshot": seed["snapshot"],
+                "isolation": "independent_per_attempt",
+                "notes": ["Each attempt starts from the same frozen SQLite backup in an independent writable database.",
+                          "Warm evidence is the observed cache counts, not the existence of a seed."]}
+    if mode != "cold":
+        raise ValueError(f"unknown cache mode {mode!r}")
+    path = _cache_attempt_path(workdir, mode)
+    return {"mode": mode, "status": "fresh_empty_namespace", "path": path, "seeded": False,
+            "initial_sha256": digest_bytes(b""), "initial_bytes": 0,
+            "isolation": "independent_per_attempt",
+            "notes": ["This database starts empty and is not shared with another attempt or arm."]}
+
+
+def purpose_bucket(purpose):
+    return TASK_PURPOSES.get(purpose, "other")
+
+
+def ledger_row(raw, origin, scope):
+    """One ledger attempt. IDs are unique within one OMP invocation, so the key is scoped to the attempt."""
+    row_id = raw.get("id")
+    if not isinstance(row_id, str) or not row_id:
+        return None
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else None
+    reported = usage_reported_cost(usage)
+    tokens = usage_tokens(usage)
+    empty_failed_usage = raw.get("stopReason") in ("error", "aborted") and not any(
+        value is not None and value > 0 for value in tokens.values())
+    cost_unknown = raw.get("costUnknown") is True or reported is None or empty_failed_usage
+    # Stock usage does not attest actual provider billing rather than a catalog calculation.
+    estimated = raw.get("estimated") is not False
+    retained = {key: raw[key] for key in (
+        "id", "parentId", "timestamp", "purpose", "role", "api", "provider", "model", "stopReason",
+        "selectedModel", "primaryModel", "fallback", "responseModel", "cache", "questions",
+        "cachedQuestions", "estimated", "costUnknown") if key in raw}
+    retained["usage"] = {**tokens, "cost": reported}
+    return {
+        "key": f"{scope}/{origin}/{row_id}",
+        "id": row_id,
+        "attempt_id": scope,
+        "origin": origin,
+        "purpose": raw.get("purpose"),
+        "role": raw.get("role"),
+        "bucket": purpose_bucket(raw.get("purpose")),
+        "timestamp": raw.get("timestamp"),
+        "api": raw.get("api"),
+        "provider": raw.get("provider"),
+        "model": raw.get("model"),
+        "stop_reason": raw.get("stopReason"),
+        "selected_model": raw.get("selectedModel"),
+        "primary_model": raw.get("primaryModel"),
+        "fallback": raw.get("fallback"),
+        "response_model": raw.get("responseModel"),
+        "cache": raw.get("cache"),
+        "questions": raw.get("questions"),
+        "cached_questions": raw.get("cachedQuestions"),
+        "estimated": estimated,
+        "cost_unknown": cost_unknown,
+        "cost_basis": "unknown" if cost_unknown else "catalog_estimate" if estimated else "reported",
+        "reported_cost": None if cost_unknown else reported,
+        "tokens": tokens,
+        "raw": retained,
+    }
+
+
+def read_session_usage(session_dir, scope, repo, complete):
+    """Project only accounting rows from this invocation's private persisted session.
+
+    An isolated invocation should own exactly one top-level session. Ambiguous, foreign,
+    truncated or unfinished sessions never establish complete ledger collection. Collection
+    does not establish billing coverage: stock completion calls are not journaled here. No session
+    transcripts, credential pins, diagnostic error strings or paths enter the projection.
+    """
+    entries, conflicts = [], []
+    files = sorted(Path(session_dir).glob("*.jsonl"))
+    evidence = {"source": "persisted_session_model_usage", "session_files": len(files),
+                "invocation_complete": complete, "retained": "accounting_projection_only"}
+    if not files:
+        return entries, conflicts, "absent", evidence
+    if len(files) != 1:
+        conflicts.append({"reason": "isolated invocation has ambiguous session files"})
+        return entries, conflicts, "incomplete", evidence
+    path = files[0]
+    if path.is_symlink() or not path.is_file():
+        conflicts.append({"reason": "session ledger is not a regular owned file"})
+        return entries, conflicts, "incomplete", evidence
+    headers, valid_header, malformed = 0, False, False
+    try:
+        with path.open(encoding="utf-8") as source:
+            for line in source:
+                if not line.strip():
+                    continue
+                if not line.endswith("\n"):
+                    malformed = True
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    malformed = True
+                    continue
+                if not isinstance(record, dict):
+                    malformed = True
+                    continue
+                if record.get("type") == "session":
+                    headers += 1
+                    cwd = record.get("cwd")
+                    valid_header = (isinstance(record.get("id"), str) and bool(record["id"])
+                                    and isinstance(cwd, str) and Path(cwd).resolve() == repo.resolve())
+                elif record.get("type") == "model_usage":
+                    required = ("id", "timestamp", "purpose", "api", "provider", "model", "stopReason")
+                    if not all(isinstance(record.get(key), str) and record[key] for key in required) \
+                            or not isinstance(record.get("usage"), dict):
+                        malformed = True
+                    row = ledger_row(record, "auxiliary", scope)
+                    if row is not None:
+                        entries.append(row)
+                    else:
+                        malformed = True
+    except (OSError, UnicodeError, ValueError):
+        malformed = True
+    if headers != 1 or not valid_header:
+        conflicts.append({"reason": "session header does not identify this invocation workspace"})
+        # Never attach unrelated session costs to this attempt, even as a subtotal.
+        entries = []
+    if malformed:
+        conflicts.append({"reason": "persisted session ledger is malformed or truncated"})
+    state = "complete" if complete and not conflicts else "incomplete"
+    return entries, conflicts, state, evidence
+
+
+def accumulate_bucket(entries):
+    tokens = {name: 0 for name in TOKEN_FIELDS}
+    reported, unknown, estimated, tokens_complete = 0.0, False, False, True
+    for entry in entries:
+        estimated = estimated or entry["estimated"]
+        unknown = unknown or entry["cost_unknown"]
+        if entry["reported_cost"] is not None:
+            reported += entry["reported_cost"]
+        for name, value in entry["tokens"].items():
+            if value is None:
+                tokens_complete = False
+            else:
+                tokens[name] += value
+    return {"entries": len(entries), "reported_cost": None if unknown else reported,
+            "reported_subtotal": reported, "cost_unknown": unknown, "estimated": estimated,
+            "tokens": tokens, "tokens_complete": tokens_complete}
+
+
+def finalize_accounting(entries, conflicts, snapshots):
+    """Sum scoped ledger keys once; snapshot states describe collection, not billing coverage.
+
+    Stock completion calls are not journaled in model_usage. Even a settled, fully read
+    session (including one with judgment rows) cannot attest completion or total cost.
+    """
+    unique, seen, duplicates = [], {}, []
+    conflicts = list(conflicts)
+    for entry in entries:
+        previous = seen.get(entry["key"])
+        if previous is None:
+            seen[entry["key"]] = entry
+            unique.append(entry)
+            continue
+        duplicates.append(entry["key"])
+        if previous["raw"] != entry["raw"]:
+            conflicts.append({"key": entry["key"], "reason": "same ledger id has conflicting payloads"})
+    reasons = []
+    if not snapshots or "absent" in snapshots:
+        reasons.append("auxiliary ledger snapshot absent")
+    if "incomplete" in snapshots:
+        reasons.append("persisted auxiliary ledger coverage incomplete")
+    if conflicts:
+        reasons.append("ledger conflict")
+    collection_complete = not reasons
+    buckets = {
+        "outer": [entry for entry in unique if entry["origin"] == "outer"],
+        "judgment": [entry for entry in unique if entry["origin"] == "auxiliary" and entry["bucket"] == "judgment"],
+        "completion": [entry for entry in unique if entry["origin"] == "auxiliary" and entry["bucket"] == "completion"],
+        "other": [entry for entry in unique if entry["origin"] == "auxiliary" and entry["bucket"] == "other"],
+    }
+    buckets["auxiliary"] = buckets["judgment"] + buckets["completion"] + buckets["other"]
+    buckets["total"] = buckets["outer"] + buckets["auxiliary"]
+    totals = {name: accumulate_bucket(rows) for name, rows in buckets.items()}
+    if totals["total"]["cost_unknown"]:
+        reasons.append("an observed attempt has unknown cost")
+    observed_cost_incomplete = bool(reasons)
+    reasons.append("stock completion journaling unavailable; completion billing coverage unknown")
+    for name, bucket in totals.items():
+        # Row/token sums remain observed subtotals, never evidence of missing calls costing zero.
+        bucket["coverage_unknown"] = not collection_complete or name in ("completion", "auxiliary", "total")
+        if bucket["coverage_unknown"]:
+            bucket["tokens_complete"] = False
+        if observed_cost_incomplete or bucket["coverage_unknown"]:
+            bucket["reported_cost"] = None
+            bucket["cost_unknown"] = True
+    return {
+        "entries": unique,
+        "conflicts": conflicts,
+        "snapshot_statuses": list(snapshots),
+        "collection_status": "complete" if collection_complete else "incomplete",
+        "duplicate_keys_ignored": sorted(set(duplicates)),
+        "monetary_status": "incomplete",
+        "monetary_reasons": reasons,
+        "totals": totals,
+        "grading_cost": {"measured": False, "reported_cost": None,
+                         "notes": ["Execution results never include grading overhead."]},
+    }
+
+
+def merge_accounting(records):
+    # Reapply stock coverage limits after merging; complete collection never seals billing.
+    return finalize_accounting([entry for record in records for entry in record["entries"]],
+                               [conflict for record in records for conflict in record["conflicts"]],
+                               [state for record in records for state in (record["snapshot_statuses"] or ["absent"])])
+
+
+def cache_evidence(rows):
+    counts = {"miss": 0, "partial": 0, "hit": 0, "unknown": 0}
+    known = {"questions": 0, "cached_questions": 0}
+    unknown = {"questions": 0, "cached_questions": 0}
+    for row in rows:
+        counts[row.get("cache") if row.get("cache") in ("miss", "partial", "hit") else "unknown"] += 1
+        for name in known:
+            value = row.get(name)
+            if type(value) is int and value >= 0:
+                known[name] += value
+            else:
+                unknown[name] += 1
+    return {"rows": len(rows), "row_counts": counts,
+            "questions_known": known["questions"], "questions_unknown_rows": unknown["questions"],
+            "cached_questions_known": known["cached_questions"],
+            "cached_questions_unknown_rows": unknown["cached_questions"]}
+
+
+def receipt_projection(receipt):
+    """Keep method evidence, not provider diagnostic strings or rubric/transcript copies."""
+    fields = ("schema", "strategy", "question_hash", "frozen_question_hash", "batch_ids", "unit_ids",
+              "original_ids", "answered_ids", "error_ids", "excluded_ids", "group_sizes", "group_slots",
+              "complete", "provenance_complete", "cache_counts", "questions", "cached_questions",
+              "question_counts_unknown")
+    projected = {key: receipt[key] for key in fields if key in receipt}
+    for key in ("coverage_errors",):
+        errors = receipt.get(key)
+        projected[key] = ["host coverage failure"] * len(errors) if isinstance(errors, list) else None
+    exclusions = receipt.get("exclusions")
+    if isinstance(exclusions, dict):
+        projected["exclusions"] = {
+            uid: reason if reason in ("empty rendered unit", "empty group state") else "excluded"
+            for uid, reason in exclusions.items()}
+    batches = receipt.get("batches")
+    if isinstance(batches, list):
+        projected["batches"] = []
+        for batch in batches:
+            if not isinstance(batch, dict):
+                projected["batches"].append(None)
+                continue
+            value = {key: batch[key] for key in ("batch_id", "planned_ids", "answered_ids", "error_ids")
+                     if key in batch}
+            errors = batch.get("coverage_errors")
+            value["coverage_errors"] = ["host coverage failure"] * len(errors) if isinstance(errors, list) else None
+            items = batch.get("items")
+            if isinstance(items, list):
+                value["items"] = [
+                    {key: item[key] for key in (
+                        "id", "batch_id", "selected_model", "primary_model", "response_model",
+                        "fallback", "cache", "questions", "cached_questions") if key in item}
+                    if isinstance(item, dict) else None for item in items]
+            projected["batches"].append(value)
+    return projected
+
+
+def parse_receipts(results):
+    """Helper receipts found in actual eval tool results; identical receipt objects count once."""
+    receipts, seen = [], set()
+    for value in structured_values(results):
+        receipt = value.get("jevify_receipt") if isinstance(value.get("jevify_receipt"), dict) else None
+        if receipt is None and {"strategy", "batch_ids", "unit_ids"} <= set(value):
+            receipt = value
+        if receipt is None or receipt.get("schema") != 2 or not isinstance(receipt.get("unit_ids"), list):
+            continue
+        receipt = receipt_projection(receipt)
+        identity = digest_json(receipt)
+        if identity not in seen:
+            seen.add(identity)
+            receipts.append(receipt)
+    return receipts
+
+
+def receipt_outcomes(receipts, planned_ids):
+    """Latest actual outcome per unit across receipts. Unresolved units are reported, not scored as adherence."""
+    latest = {}
+    for receipt in receipts:
+        for uid in string_ids(receipt.get("answered_ids")) or []:
+            latest[uid] = "answered"
+        for uid in string_ids(receipt.get("error_ids")) or []:
+            latest[uid] = "error"
+        for uid in string_ids(receipt.get("excluded_ids")) or []:
+            latest[uid] = "excluded"
+    planned = planned_ids if planned_ids is not None else list(latest)
+    return {
+        "planned": None if planned_ids is None else len(planned_ids),
+        "answered_ids": [uid for uid in planned if latest.get(uid) == "answered"],
+        "error_ids": [uid for uid in planned if latest.get(uid) == "error"],
+        "excluded_ids": [uid for uid in planned if latest.get(uid) == "excluded"],
+        "uncovered_ids": [uid for uid in planned if uid not in latest],
+        "unplanned_ids": [] if planned_ids is None else sorted(set(latest) - set(planned_ids)),
+    }
+
+
+def receipt_problems(receipt, strategy, rubric_hash):
+    if any(receipt.get(name) is None for name in ("unit_ids", "answered_ids", "error_ids")):
+        return []  # Missing evidence is handled as unverified, not a method violation.
+    units, answered, errors = (string_ids(receipt.get(name)) for name in ("unit_ids", "answered_ids", "error_ids"))
+    if units is None or answered is None or errors is None:
+        return ["receipt ID lists are malformed"]
+    problems = []
+    if any(len(set(ids)) != len(ids) for ids in (units, answered, errors)):
+        problems.append("receipt repeats a unit ID")
+    if set(answered) & set(errors) or set(answered) | set(errors) != set(units):
+        problems.append("receipt answered and error IDs do not partition its unit IDs")
+    originals, excluded = (string_ids(receipt.get(name)) for name in ("original_ids", "excluded_ids"))
+    exclusions = receipt.get("exclusions")
+    if all(receipt.get(name) is not None for name in ("original_ids", "excluded_ids", "exclusions")) and \
+            (originals is None or excluded is None or not isinstance(exclusions, dict)):
+        problems.append("receipt original/exclusion manifest is malformed")
+    elif originals is not None and excluded is not None and isinstance(exclusions, dict) and (\
+            len(set(originals)) != len(originals) or len(set(excluded)) != len(excluded) or \
+            set(units) & set(excluded) or set(units) | set(excluded) != set(originals) or \
+            set(exclusions) != set(excluded)):
+        problems.append("receipt units and exclusions do not partition its original IDs")
+    if receipt.get("coverage_errors"):
+        problems.append("receipt reports host coverage failures")
+    if rubric_hash is not None and receipt.get("question_hash") is not None and receipt["question_hash"] != rubric_hash:
+        problems.append("receipt question hash differs from the unchanged public rubric")
+    sizes, slots = receipt.get("group_sizes"), receipt.get("group_slots")
+    if strategy == "jev-grouped":
+        if sizes is None or slots is None:
+            return problems
+        if not isinstance(sizes, list) or not sizes or any(type(size) is not int for size in sizes) \
+                or not isinstance(slots, dict):
+            return problems + ["grouped receipt lacks group sizes and slots"]
+        members = [string_ids(ids) for ids in slots.values()]
+        if any(ids is None for ids in members) or [len(ids) for ids in members] != sizes:
+            problems.append("grouped receipt sizes do not match its slots")
+        elif sorted(uid for ids in members for uid in ids) != sorted(units):
+            problems.append("grouped receipt slots do not cover exactly its unit IDs")
+        if any(not 1 <= size <= GROUPED_K for size in sizes):
+            problems.append(f"grouped receipt has a group outside 1..{GROUPED_K}")
+        if max(sizes) < 2:
+            problems.append("grouped receipt has no multi-slot group")
+    elif sizes or slots:
+        problems.append("flat receipt reports groups")
+    if receipt.get("complete") is False and not errors and not receipt.get("excluded_ids"):
+        problems.append("receipt is incomplete without unit errors or exclusions")
+    return problems
+
+
+def answered_host_items(receipt):
+    """Host judgment items a receipt claims returned answers: states for flat, groups for grouped."""
+    answered = set(string_ids(receipt.get("answered_ids")) or [])
+    slots = receipt.get("group_slots")
+    if isinstance(slots, dict) and slots:
+        return sum(1 for ids in slots.values() if answered & set(string_ids(ids) or []))
+    return len(answered)
+
+
+def receipt_cache_evidence(receipt):
+    """Corroboration from a model-printable helper result, never independent host billing proof."""
+    counts = receipt.get("cache_counts")
+    batch_ids = string_ids(receipt.get("batch_ids"))
+    batches = receipt.get("batches")
+    if not batch_ids or not all(batch_ids) or not isinstance(batches, list) or not batches:
+        return None
+    if any(not isinstance(batch, dict) for batch in batches) or \
+            [batch.get("batch_id") for batch in batches] != batch_ids or \
+            len(set(batch_ids)) != len(batch_ids) or \
+            any(batch.get("coverage_errors") != [] for batch in batches):
+        return None
+    slots = receipt.get("group_slots")
+    units = string_ids(receipt.get("unit_ids"))
+    if units is None or (slots is not None and not isinstance(slots, dict)):
+        return None
+    if slots and any(string_ids(ids) is None for ids in slots.values()):
+        return None
+    host_ids = set(slots or units)
+    latest, final_items = {}, {}
+    for batch in batches:
+        planned, answered, errors = (string_ids(batch.get(key)) for key in
+                                     ("planned_ids", "answered_ids", "error_ids"))
+        if any(ids is None or len(ids) != len(set(ids)) for ids in (planned, answered, errors)):
+            return None
+        if not set(planned) <= host_ids or set(answered) & set(errors) or \
+                set(answered) | set(errors) != set(planned):
+            return None
+        items = batch.get("items")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            return None
+        seen = set()
+        for item in items:
+            key = item.get("id")
+            if not isinstance(key, str) or key not in planned or key in seen or \
+                    item.get("batch_id") != batch["batch_id"]:
+                return None
+            seen.add(key)
+        if not set(answered) <= seen:
+            return None
+        # A retry supersedes the earlier item even if that retry delivered no item.
+        final_items.update({key: None for key in planned})
+        final_items.update({item["id"]: item for item in items})
+        latest.update({key: "answered" for key in answered})
+        latest.update({key: "error" for key in errors})
+    if set(latest) != host_ids:
+        return None
+    answered_units = string_ids(receipt.get("answered_ids"))
+    if answered_units is None:
+        return None
+    expected_answers = ({key for key, ids in slots.items() if set(ids) & set(answered_units)}
+                        if slots else set(answered_units))
+    if {key for key, outcome in latest.items() if outcome == "answered"} != expected_answers:
+        return None
+    if not expected_answers:
+        return None
+    observed = {"hit": 0, "partial": 0, "miss": 0, "unknown": 0}
+    total_questions = total_cached = unknown_questions = cached_answers = 0
+    for key, item in final_items.items():
+        if item is None:
+            observed["unknown"] += 1
+            unknown_questions += 1
+            continue  # A reported unit error is an outcome, not proof of successful judging.
+        selected, primary = item.get("selected_model"), item.get("primary_model")
+        cache, questions, cached = item.get("cache"), item.get("questions"), item.get("cached_questions")
+        counts_known = type(questions) is int and type(cached) is int and 0 <= cached <= questions
+        if key in expected_answers:
+            if not isinstance(selected, str) or not selected or not isinstance(primary, str) or not primary or \
+                    type(item.get("fallback")) is not bool or item["fallback"] != (selected != primary):
+                return None
+            if cache not in ("hit", "partial", "miss") or not counts_known or questions < 1:
+                return None
+            expected_cache = "hit" if cached == questions else "miss" if cached == 0 else "partial"
+            if cache != expected_cache:
+                return None
+            cached_answers += cache == "hit"
+        observed[cache if cache in ("hit", "partial", "miss") else "unknown"] += 1
+        if counts_known:
+            total_questions += questions
+            total_cached += cached
+        else:
+            unknown_questions += 1
+    if not isinstance(counts, dict) or any(type(counts.get(key)) is not int or counts[key] < 0
+                                           for key in ("hit", "partial", "miss", "unknown")):
+        return None
+    host_items = len(receipt.get("group_slots") or receipt.get("unit_ids") or [])
+    if sum(counts[key] for key in ("hit", "partial", "miss", "unknown")) != host_items or \
+            receipt.get("question_counts_unknown") != unknown_questions:
+        return None
+    questions, cached = receipt.get("questions"), receipt.get("cached_questions")
+    if type(questions) is not int or type(cached) is not int or not 0 <= cached <= questions:
+        return None
+    if observed != counts or questions != total_questions or cached != total_cached:
+        return None
+    if counts["hit"] == host_items and host_items and (questions <= 0 or cached != questions):
+        return None
+    return {"cached_items": cached_answers, "uncached_questions": questions - cached,
+            "unknown_error_items": observed["unknown"],
+            "fully_cached": host_items > 0 and counts["hit"] == host_items
+                            and receipt.get("complete") is True,
+            "evidence_class": "helper_receipt_not_independent_host_proof"}
+
+
+def method_evidence(calls, receipts, accounting, plan, strategy):
+    auxiliary = [row for row in accounting["entries"] if row["origin"] == "auxiliary"]
+    judgments = [row for row in auxiliary if row["bucket"] == "judgment"]
+    completions = [row for row in auxiliary if row["bucket"] == "completion"]
+    runtime = [row for row in auxiliary if row["bucket"] == "other"]
+    markers = []
+    for index, call in enumerate(calls):
+        code = str((call.get("args") or {}).get("code", "")) if call["tool"] == "eval" else ""
+        found = [marker for marker in SOURCE_MARKERS if marker in code]
+        if found:
+            markers.append({"call_index": index, "markers": found})
+    relevant = [receipt for receipt in receipts if receipt.get("strategy") == strategy] \
+        if strategy in JEV_STRATEGIES else receipts
+    valid_receipts = [receipt for receipt in receipts
+                      if receipt.get("strategy") in JEV_STRATEGIES
+                      and not receipt_problems(receipt, receipt["strategy"], None)
+                      and string_ids(receipt.get("original_ids")) is not None
+                      and string_ids(receipt.get("excluded_ids")) is not None
+                      and isinstance(receipt.get("exclusions"), dict)
+                      and answered_host_items(receipt) > 0
+                      and (cache_receipt := receipt_cache_evidence(receipt)) is not None
+                      and cache_receipt["cached_items"] > 0]
+    return {
+        "judged": True if judgments or valid_receipts else None,
+        "judged_evidence_class": ("persisted_model_usage" if judgments else
+                                  "helper_receipt_not_independent_host_proof" if valid_receipts else
+                                  "unverified"),
+        "receipt_evidence_class": "tool_result_model_printable_not_independent_host_proof",
+        "receipt_cache": [receipt_cache_evidence(receipt) for receipt in receipts],
+        "snapshot_statuses": accounting["snapshot_statuses"],
+        "conflicts": accounting["conflicts"],
+        "actual_receipts": receipts,
+        "actual_receipt_strategies": sorted({receipt.get("strategy") for receipt in receipts
+                                             if isinstance(receipt.get("strategy"), str)}),
+        "task_judgment_ledger_rows": len(judgments),
+        "task_completion_ledger_rows": len(completions),
+        "runtime_auxiliary_ledger_rows": len(runtime),
+        "runtime_auxiliary_purposes": sorted({str(row.get("purpose")) for row in runtime}),
+        "cache": cache_evidence(judgments),
+        "plan": plan,
+        "unit_outcomes": receipt_outcomes(relevant, plan["planned_ids"]),
+        "source_marker_diagnostics": markers,
+        "source_marker_diagnostics_are_not_execution_proof": True,
+    }
+
+
+def adherence(strategy, method):
+    """Whether the requested method actually ran. Unit errors are outcomes, reported in unit_outcomes."""
+    if strategy == "auto":
+        return {"status": "not_applicable", "passed": None, "reasons": [], "unverified": []}
+    receipts = method["actual_receipts"]
+    judgments = method["task_judgment_ledger_rows"]
+    reasons, unverified = [], []
+    if strategy == "direct-script":
+        if judgments or method["task_completion_ledger_rows"]:
+            reasons.append("task-driven nested judgment or completion attempt observed")
+        if receipts:
+            reasons.append("Jevify helper receipt observed")
+        snapshots = method.get("snapshot_statuses")
+        if not snapshots or any(state != "complete" for state in snapshots) or method.get("conflicts"):
+            unverified.append("auxiliary ledger coverage is not complete")
+        if not reasons:
+            unverified.append("persisted usage does not record cache-only judgments")
+    else:
+        plan = method["plan"]
+        matching = [receipt for receipt in receipts if receipt.get("strategy") == strategy]
+        if not matching:
+            unverified.append(f"no actual {strategy} helper receipt")
+        if len(matching) != len(receipts):
+            reasons.append("a helper receipt with another strategy was observed")
+        for index, receipt in enumerate(matching):
+            required = ("original_ids", "excluded_ids", "exclusions", "answered_ids", "error_ids",
+                        "group_sizes", "group_slots", "complete", "batch_ids", "batches", "question_hash",
+                        "coverage_errors")
+            missing = [name for name in required if receipt.get(name) is None]
+            if missing:
+                unverified.append(f"receipt {index}: missing evidence fields: {', '.join(missing)}")
+            reasons.extend(f"receipt {index}: {problem}"
+                           for problem in receipt_problems(receipt, strategy, plan["rubric_hash"]))
+            if not string_ids(receipt.get("batch_ids")) or not all(receipt["batch_ids"]):
+                unverified.append(f"receipt {index}: host batch identity unavailable")
+        if plan["rubric_hash"] is None:
+            unverified.append("public rubric unavailable; question hash not checked")
+        covered = {uid for receipt in matching for uid in string_ids(receipt.get("unit_ids")) or []}
+        if plan["planned_ids"] is None:
+            unverified.append("public unit plan unavailable; coverage not checked")
+        elif matching:
+            planned = set(plan["planned_ids"])
+            if planned - covered:
+                reasons.append(f"receipts do not cover {len(planned - covered)} planned IDs")
+            if covered - planned:
+                reasons.append(f"receipts cover {len(covered - planned)} IDs outside the public plan")
+        cached = [receipt_cache_evidence(receipt) for receipt in matching]
+        cached_items = sum(item["cached_items"] for item in cached if item is not None)
+        if judgments + cached_items < sum(answered_host_items(receipt) for receipt in matching):
+            unverified.append("billed rows and explicit cache receipts do not corroborate every answered item")
+        if matching and any(item is None for item in cached):
+            unverified.append("explicit helper cache metadata unavailable for corroboration")
+        snapshots = method.get("snapshot_statuses")
+        if not snapshots or any(state != "complete" for state in snapshots) or method.get("conflicts"):
+            unverified.append("auxiliary ledger coverage is not complete")
+    status = "violation" if reasons else "unverified" if unverified else "pass"
+    return {"status": status, "passed": False if reasons else None if unverified else True,
+            "reasons": reasons, "unverified": unverified,
+            "evidence_class": "persisted_usage_and_model_printable_helper_receipts"}
+
+
+def execution_status(answered, calls, stop):
+    if not calls and not answered:
+        return "infra"
+    if stop in ("deadline", "max_calls"):
+        return "incomplete"
+    return "complete" if answered else "failed"
+
+
+def route_evidence(rows, receipts=()):
+    rows = [row for row in rows if row["origin"] == "auxiliary"]
+    items = [item for receipt in receipts for batch in receipt.get("batches", []) if isinstance(batch, dict)
+             for item in batch.get("items", []) if isinstance(item, dict)]
+    return {
+        "evidence_class": "persisted_usage_metadata",
+        "helper_receipts": {
+            "evidence_class": "model_printable_helper_items_not_independent_host_proof",
+            "items": len(items),
+            "selected_models": sorted({item["selected_model"] for item in items
+                                       if isinstance(item.get("selected_model"), str)}),
+            "primary_models": sorted({item["primary_model"] for item in items
+                                      if isinstance(item.get("primary_model"), str)}),
+            "response_models": sorted({item["response_model"] for item in items
+                                       if isinstance(item.get("response_model"), str)}),
+            "fallback_items": sum(item.get("fallback") is True for item in items),
+            "unknown_route_items": sum(not isinstance(item.get("selected_model"), str)
+                                       or not isinstance(item.get("primary_model"), str)
+                                       or type(item.get("fallback")) is not bool for item in items),
+        },
+        "selected_models": sorted({row["selected_model"] for row in rows if isinstance(row.get("selected_model"), str)}),
+        "primary_models": sorted({row["primary_model"] for row in rows if isinstance(row.get("primary_model"), str)}),
+        "response_models": sorted({row["response_model"] for row in rows if isinstance(row.get("response_model"), str)}),
+        "fallback_rows": sum(row.get("fallback") is True for row in rows),
+        "provenance_unknown_rows": sum(row.get("selected_model") is None or row.get("primary_model") is None
+                                       for row in rows if row.get("purpose") == "judgment"),
+    }
 
 
 def _die_with_parent():
@@ -107,170 +1061,282 @@ def _die_with_parent():
 
 
 def kill_tree(proc):
+    if proc.poll() is not None:
+        return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
         proc.wait(timeout=5)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-    except Exception:
-        pass
+        proc.wait()
 
 
 def run_one(case, rep, overlay, desc_probe, args, workdir):
     """Run a case, retrying sessions that never produced a tool call or an answer.
 
-    Those are provider or startup failures, not trigger decisions; a run that still fails
-    after the retries is marked infra and excluded from the rates.
+    Those are provider or startup failures, not strategy decisions. Every attempt,
+    including failed and incomplete ones, remains in the result with its own costs.
     """
+    attempts = []
     for attempt in range(args.retries + 1):
-        result = attempt_one(case, rep, attempt, overlay, desc_probe, args, workdir)
-        if not result["infra"]:
+        attempts.append(attempt_one(case, rep, attempt, overlay, desc_probe, args, workdir))
+        if attempts[-1]["execution_status"] != "infra":
             break
-    result["attempts"] = attempt + 1
+    result = dict(attempts[-1])
+    result["attempts"] = len(attempts)
+    result["attempt_records"] = attempts
+    result["final_attempt_id"] = attempts[-1]["attempt_id"]
+    result["accounting"] = merge_accounting([item["accounting"] for item in attempts])
+    result["cost_ledger"] = result["accounting"]
     return result
 
 
 def attempt_one(case, rep, attempt, overlay, desc_probe, args, workdir):
-    repo = fixture.build(workdir / f"{case['id']}-{rep}-{attempt}", scale=case.get("scale", 1))
-    argv = [args.omp, "--no-session", "--mode", "json", "--auto-approve", "--config", str(overlay),
-            "--tools", TOOLS, "--max-time", str(args.max_time)]
+    attempt_id = f"{case['id']}:{rep}:{attempt}"
+    invocation = uuid.uuid4().hex  # namespaces outer messages that carry no provider response id
+    dataset = case.get("dataset", "billing")
+    repo = fixture.build(workdir / f"{case['id']}-{rep}-{attempt}", scale=case.get("scale", 1), dataset=dataset)
+    plan = public_plan(repo)
+    prompt = strategy_prompt(case, repo, args.strategy)
+    namespace = getattr(args, "cache_seed", None) if args.cache_mode == "warm" else args.cache_namespace
+    cache = cache_plan(args.cache_mode, namespace, workdir, case["id"], rep, attempt)
+    session_dir = Path(tempfile.mkdtemp(prefix="session-", dir=workdir))
+    argv = [args.omp, "--session-dir", str(session_dir), "--mode", "json", "--auto-approve", "--config", str(overlay),
+            *SESSION_FLAGS, "--tools", TOOLS, "--max-time", str(args.max_time)]
     if args.model:
         argv += ["--model", args.model]
     if args.thinking:
         argv += ["--thinking", args.thinking]
-    argv.append(case["prompt"])
+    argv.append(prompt)
+    env = os.environ.copy()
+    if cache["path"] is not None:
+        env["OMP_JUDGMENT_CACHE_DB"] = str(cache["path"])
+    stem = f"{case['id']}-{rep}-{attempt}"
+    raw_path, stderr_path = Path(args.raw_dir) / f"{stem}.jsonl", Path(args.raw_dir) / f"{stem}.stderr"
     started = time.time()
-    proc = subprocess.Popen(argv, cwd=repo, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, preexec_fn=_die_with_parent)
+    # stderr goes to a file: a pipe nobody drains while stdout is read can block the session.
+    with stderr_path.open("w") as stderr_sink:
+        proc = subprocess.Popen(argv, cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=stderr_sink, text=True, preexec_fn=_die_with_parent)
     LIVE.add(proc)
-    calls, errors, model = [], 0, None
-    thinking = None  # first thinking_level_changed "resolved" level (what auto picked)
-    skill_at = helpers = judged = None
-    skill_source_ok = None
-    stop = None
+    calls, errors, model, thinking = [], 0, None, None
+    skill_at = helpers = skill_source_ok = stop = None
     answered = False
-    answer = ""
+    messages, final_answers = [], []
     usage = {"input": None, "output": None, "cache_read": None, "cache_write": None, "cost": None}
-    grace = None  # reaps a process that lingers after agent_end
-    watchdog = threading.Timer(args.max_time + 30, kill_tree, (proc,))
+    entries, conflicts = [], []
+    agent_ended = False
+    stream_malformed = False
+    forced, deadline_reached = threading.Event(), threading.Event()
+
+    def terminate(deadline=False):
+        if proc.poll() is None:
+            forced.set()
+            if deadline:
+                deadline_reached.set()
+            kill_tree(proc)
+
+    watchdog = threading.Timer(args.max_time + 30, terminate, kwargs={"deadline": True})
     watchdog.start()
-    raw = open(Path(args.raw_dir) / f"{case['id']}-{rep}-{attempt}.jsonl", "w") if args.raw_dir else None
     try:
-        for line in proc.stdout:
-            if raw:
+        with raw_path.open("w") as raw:
+            for line in proc.stdout:
                 raw.write(line)
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                continue
-            kind = ev.get("type")
-            msg = ev.get("message")
-            if model is None and isinstance(msg, dict) and isinstance(msg.get("model"), str):
-                model = msg["model"]
-            if kind == "thinking_level_changed" and thinking is None:
-                thinking = ev.get("resolved")
-            if kind == "message_end" and isinstance(msg, dict) and msg.get("role") == "assistant":
-                add_usage(usage, msg.get("usage"))
-                text = message_text(msg).strip()
-                if text:
-                    answer = text
-                if msg.get("stopReason") == "stop":
-                    answered = True
-            if kind == "agent_end" and grace is None:
-                grace = threading.Timer(AGENT_END_GRACE, kill_tree, (proc,))
-                grace.start()
-            elif kind == "agent_start" and grace is not None:
-                grace.cancel()
-                grace = None
-            if kind == "tool_execution_start":
-                tool, targs = ev.get("toolName"), ev.get("args") or {}
-                calls.append({"id": ev.get("toolCallId"), "tool": tool, "args": targs})
-                idx = len(calls) - 1
-                text = json.dumps(targs)
-                if skill_at is None and tool == "read" and str(targs.get("path", "")).startswith("skill://jevify"):
-                    skill_at = idx
-                if tool == "eval":
-                    code = str(targs.get("code", ""))
-                    if helpers is None and "skill://jevify/jevify.py" in code:
-                        helpers = idx
-                    if judged is None and any(m in code for m in JUDGE_MARKERS):
-                        judged = idx
-                calls[-1]["data"] = "skill://" not in text
-            elif kind == "tool_execution_end":
-                call = next((c for c in calls if c["id"] == ev.get("toolCallId")), None)
-                if call and ev.get("isError") and call["tool"] == "eval":
-                    errors += 1
-                if desc_probe and call and calls.index(call) == skill_at and skill_source_ok is None:
-                    skill_source_ok = desc_probe in json.dumps(ev.get("result"))
-            if len(calls) >= args.max_calls:
-                stop = "max_calls"
-                break
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    stream_malformed = True
+                    continue
+                if not isinstance(ev, dict):
+                    stream_malformed = True
+                    continue
+                kind = ev.get("type")
+                msg = ev.get("message")
+                if model is None and isinstance(msg, dict) and isinstance(msg.get("model"), str):
+                    model = msg["model"]
+                if kind == "thinking_level_changed" and thinking is None:
+                    thinking = ev.get("resolved")
+                if kind == "message_end" and isinstance(msg, dict) and msg.get("role") == "assistant":
+                    index = len(messages)
+                    text = message_text(msg).strip()
+                    reason = msg.get("stopReason")
+                    response_id = msg.get("responseId")
+                    row_id = response_id if isinstance(response_id, str) and response_id else f"outer:{invocation}:{index}"
+                    messages.append({"index": index, "stop_reason": reason, "text": text, "ledger_id": row_id})
+                    add_usage(usage, msg.get("usage"))
+                    failed_outer_unknown_cost = reason in ("error", "aborted") and not any(
+                        value is not None and value > 0 for value in usage_tokens(msg.get("usage")).values())
+                    # Chat usage carries no billing proof, so its cost is a catalog estimate.
+                    entries.append(ledger_row({"id": row_id, "purpose": "outer_assistant", "api": msg.get("api"),
+                                               "provider": msg.get("provider"), "model": msg.get("model"),
+                                               "usage": msg.get("usage"), "stopReason": reason,
+                                               "timestamp": msg.get("timestamp"), "estimated": True,
+                                               "costUnknown": failed_outer_unknown_cost},
+                                              "outer", attempt_id))
+                    if reason == "stop":
+                        answered = True
+                        if text:
+                            final_answers.append({"source": "assistant_message", "text": text})
+                if kind == "agent_end":
+                    agent_ended = True
+                elif kind == "agent_start":
+                    agent_ended = False
+                if kind == "tool_execution_start":
+                    tool, targs = ev.get("toolName"), ev.get("args") or {}
+                    calls.append({"id": ev.get("toolCallId"), "tool": tool, "args": targs, "result": None,
+                                  "data": "skill://" not in json.dumps(targs)})
+                    if skill_at is None and tool == "read" and str(targs.get("path", "")).startswith("skill://jevify"):
+                        skill_at = len(calls) - 1
+                    if tool == "eval" and helpers is None and "skill://jevify/jevify.py" in str(targs.get("code", "")):
+                        helpers = len(calls) - 1
+                elif kind == "tool_execution_end":
+                    call = next((item for item in calls if item["id"] == ev.get("toolCallId")), None)
+                    if call is not None:
+                        call["result"] = ev.get("result")
+                        call["is_error"] = ev.get("isError") is True
+                        if call["is_error"] and call["tool"] == "eval":
+                            errors += 1
+                        if desc_probe and calls.index(call) == skill_at and skill_source_ok is None:
+                            skill_source_ok = desc_probe in json.dumps(ev.get("result"))
+                if len(calls) >= args.max_calls:
+                    stop = "max_calls"
+                    break
     finally:
-        timed_out = not watchdog.is_alive() and stop is None
-        watchdog.cancel()
-        if grace is not None:
-            grace.cancel()
-        kill_tree(proc)
-        LIVE.discard(proc)
-        if raw:
-            raw.close()
-    if timed_out:
+        try:
+            if stop is not None or sys.exc_info()[0] is not None:
+                terminate()
+            else:
+                # agent_end and stdout EOF precede session.dispose in stock print mode.
+                # Keep the invocation watchdog active while waiting for natural flush/exit.
+                proc.wait()
+        finally:
+            watchdog.cancel()
+            if proc.stdout is not None:
+                proc.stdout.close()
+            LIVE.discard(proc)
+    if deadline_reached.is_set():
         stop = "deadline"
-    first_data = next((i for i, c in enumerate(calls) if c.get("data")), None)
+    try:
+        auxiliary, session_conflicts, snapshot, session_evidence = read_session_usage(
+            session_dir, attempt_id, repo,
+            complete=proc.returncode == 0 and agent_ended and not forced.is_set()
+                     and not stream_malformed and stop is None)
+    finally:
+        shutil.rmtree(session_dir)
+    entries.extend(auxiliary)
+    conflicts.extend(session_conflicts)
+    receipts = parse_receipts([call["result"] for call in calls if call["tool"] == "eval"])
+    accounting = finalize_accounting(entries, conflicts, [snapshot])
+    accounting["session_evidence"] = {**session_evidence, "process_settled": proc.poll() is not None,
+                                      "process_returncode": proc.returncode,
+                                      "stream_malformed": stream_malformed}
+    method = method_evidence(calls, receipts, accounting, plan, args.strategy)
+    status = execution_status(answered, calls, stop)
+    first_data = next((i for i, call in enumerate(calls) if call["data"]), None)
     triggered = skill_at is not None
     return {
-        "case": case["id"], "rep": rep, "expect": case["expect"], "keyword": bool(case.get("keyword")),
-        "infra": not calls and not answered,
-        # Trigger cases pass when the skill is opened; no-trigger cases when it is not; either always.
+        "attempt_id": attempt_id,
+        "case": case["id"], "rep": rep, "attempt": attempt, "expect": case["expect"],
+        "keyword": bool(case.get("keyword")), "dataset": dataset, "key": case.get("key"),
+        "scale": case.get("scale", 1),
+        "execution_status": status,
+        "infra": status == "infra",
+        # Availability diagnostic: the skill was opened (trigger) or not (no_trigger). Not outcome quality.
         "pass": True if case["expect"] == "either" else triggered if case["expect"] == "trigger" else not triggered,
+        "strategy_adherence": adherence(args.strategy, method),
         "skill_read": triggered,
         "skill_before_data": triggered and (first_data is None or skill_at < first_data),
-        "helpers_loaded": helpers is not None, "judged": judged is not None,
+        "helpers_loaded": helpers is not None,
+        "helpers_loaded_evidence_class": "source_marker_only",
+        "judged": method["judged"],
+        "judged_evidence_class": method["judged_evidence_class"],
         "skill_source_ok": skill_source_ok, "eval_errors": errors, "calls": len(calls),
         "stop": stop or "exit", "secs": round(time.time() - started, 1), "model": model,
-        "first_tools": [c["tool"] for c in calls[:5]],
-        "answer": answer, "usage": usage, "thinking": thinking,
+        "thinking": thinking,
+        "first_tools": [call["tool"] for call in calls[:5]],
+        "answer": final_answers[-1]["text"] if final_answers else "",
+        "final_answers": final_answers,
+        "assistant_messages": messages,
+        "usage": usage,
+        "usage_evidence_class": "outer_assistant_only_compatibility",
+        "accounting": accounting,
+        "cache": {**cache, "path": None if cache["path"] is None else str(cache["path"]),
+                  "observed": method["cache"]},
+        "method": method,
+        "route": route_evidence(accounting["entries"], receipts),
+        "prompt_sha256": digest_bytes(prompt.encode()),
+        "raw_path": str(raw_path),
+        "stderr_path": str(stderr_path),
     }
 
 
 def summarize(runs):
-    valid = [r for r in runs if not r["infra"]]
+    valid = [run for run in runs if not run["infra"]]
     per_case = {}
-    for r in valid:
-        c = per_case.setdefault(r["case"], {"expect": r["expect"], "keyword": r["keyword"], "n": 0, "pass": 0,
-                                            "skill_before_data": 0, "judged": 0})
-        c["n"] += 1
-        c["pass"] += r["pass"]
-        c["skill_before_data"] += r["skill_before_data"]
-        c["judged"] += r["judged"]
-    costs = [r["usage"]["cost"] for r in valid if (r.get("usage") or {}).get("cost") is not None]
-    auto = [r for r in valid if r["expect"] == "trigger" and not r["keyword"]]
-    neg = [r for r in valid if r["expect"] == "no_trigger"]
-    kw = [r for r in valid if r["keyword"]]
-    either = [r for r in valid if r["expect"] == "either"]
+    for run in valid:
+        case = per_case.setdefault(run["case"], {"expect": run["expect"], "keyword": run["keyword"], "n": 0, "pass": 0,
+                                                "skill_before_data": 0, "judged": 0, "judged_unverified": 0,
+                                                "strategy_adherence_pass": 0, "strategy_adherence_scored": 0,
+                                                "execution_incomplete": 0})
+        case["n"] += 1
+        case["pass"] += run["pass"]
+        case["skill_before_data"] += run["skill_before_data"]
+        case["judged"] += run.get("judged") is True
+        case["judged_unverified"] += run.get("judged") is None
+        passed = (run.get("strategy_adherence") or {}).get("passed")
+        if passed is not None:
+            case["strategy_adherence_scored"] += 1
+            case["strategy_adherence_pass"] += passed
+        case["execution_incomplete"] += run.get("execution_status") in ("failed", "incomplete")
+    costs = [run["usage"]["cost"] for run in valid if (run.get("usage") or {}).get("cost") is not None]
+    auto = [run for run in valid if run["expect"] == "trigger" and not run["keyword"]]
+    neg = [run for run in valid if run["expect"] == "no_trigger"]
+    kw = [run for run in valid if run["keyword"]]
+    either = [run for run in valid if run["expect"] == "either"]
     return {
-        "auto_trigger": f"{sum(r['skill_read'] for r in auto)}/{len(auto)}",
-        "auto_judged": f"{sum(r['judged'] for r in auto)}/{len(auto)}",
-        "false_trigger": f"{sum(r['skill_read'] for r in neg)}/{len(neg)}",
-        "keyword": f"{sum(r['skill_read'] for r in kw)}/{len(kw)}",
-        "either": f"{sum(r['skill_read'] for r in either)}/{len(either)}",
+        "availability_diagnostics_are_not_outcome_quality": True,
+        "auto_trigger": f"{sum(run['skill_read'] for run in auto)}/{len(auto)}",
+        "auto_judged": f"{sum(run.get('judged') is True for run in auto)}/"
+                       f"{sum(run.get('judged') is not None for run in auto)}",
+        "auto_judged_unverified": sum(run.get("judged") is None for run in auto),
+        "false_trigger": f"{sum(run['skill_read'] for run in neg)}/{len(neg)}",
+        "keyword": f"{sum(run['skill_read'] for run in kw)}/{len(kw)}",
+        "either": f"{sum(run['skill_read'] for run in either)}/{len(either)}",
         "infra_failures": len(runs) - len(valid),
-        "eval_errors": sum(r["eval_errors"] for r in runs),
-        "skill_source_mismatch": sum(1 for r in runs if r["skill_source_ok"] is False),
-        "mean_secs": round(sum(r["secs"] for r in valid) / len(valid), 1) if valid else None,
-        "mean_cost": round(sum(costs) / len(costs), 4) if costs else None,
+        "failed_or_incomplete": sum(run.get("execution_status") in ("failed", "incomplete") for run in runs),
+        "strategy_violations": sum((run.get("strategy_adherence") or {}).get("passed") is False for run in runs),
+        "eval_errors": sum(run["eval_errors"] for run in runs),
+        "skill_source_mismatch": sum(1 for run in runs if run["skill_source_ok"] is False),
+        "mean_secs": round(sum(run["secs"] for run in valid) / len(valid), 1) if valid else None,
+        "mean_outer_compatibility_cost": round(sum(costs) / len(costs), 4) if costs else None,
         "per_case": per_case,
     }
+
+
+def validate_case(case):
+    if not isinstance(case.get("id"), str) or not case["id"]:
+        raise ValueError("every case needs a non-empty id")
+    if case.get("expect") not in ("trigger", "no_trigger", "either"):
+        raise ValueError(f"case {case['id']!r}: expect must be trigger, no_trigger or either")
+    if not isinstance(case.get("prompt"), str) or not case["prompt"].strip():
+        raise ValueError(f"case {case['id']!r} needs a goal prompt")
+    if not isinstance(case.get("scale", 1), int):
+        raise ValueError(f"case {case['id']!r} has a non-integer scale")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group()
-    src.add_argument("--ref", help="git ref whose skills/jevify is tested (default: working tree)")
-    src.add_argument("--skill-dir", help="directory containing jevify/SKILL.md")
+    src.add_argument("--ref", help="git ref whose complete skills/jevify directory is tested")
+    src.add_argument("--skill-dir", help="directory containing the complete jevify/ skill bundle")
+    ap.add_argument("--skill-bundle-label", default="actual tested skill bundle",
+                    help="label recorded for the tested bundle; file hashes remain the identity evidence")
     ap.add_argument("--cases", default=str(HERE / "cases.json"))
     ap.add_argument("--only", nargs="*", help="case ids to run")
     ap.add_argument("--reps", type=int, default=3)
@@ -278,43 +1344,69 @@ def main():
     ap.add_argument("--model", help="model selector (default: your default role)")
     ap.add_argument("--thinking", help="thinking level passed to omp (default: the configured level, usually auto)")
     ap.add_argument("--arm", choices=("skill", "none"), default="skill",
-                    help="skill: pin the skill under test; none: make jevify unavailable")
-    ap.add_argument("--omp", default=shutil.which("omp"), help="omp binary to run (default: omp on PATH)")
+                    help="skill: pin the skill under test; none: make bare and namespaced jevify unavailable")
+    ap.add_argument("--strategy", choices=STRATEGIES, default="auto",
+                    help="auto leaves the goal unchanged; explicit strategies append only method instructions")
+    ap.add_argument("--cache-mode", choices=CACHE_MODES, default="cold",
+                    help="cold isolates a fresh DB per attempt; warm clones one frozen SQLite seed per attempt")
+    ap.add_argument("--cache-namespace", help="explicit seeded judgment DB for warm mode")
+    ap.add_argument("--omp", default=shutil.which("omp"), help="omp executable to run (default: omp on PATH)")
+    ap.add_argument("--omp-source", help="source checkout the executable runs; its revision and working-tree "
+                                         "changes, untracked files and deletions are hashed")
     ap.add_argument("--max-time", type=int, default=420)
     ap.add_argument("--max-calls", type=int, default=40)
     ap.add_argument("--retries", type=int, default=1, help="retries for sessions with no tool call or answer")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--raw-dir", help="also save each session's raw JSON event stream here")
+    ap.add_argument("--raw-dir", help="directory for raw JSON events and stderr (default: beside --out)")
     ap.add_argument("--compare", help="earlier result file to diff against")
     args = ap.parse_args()
-    if not args.omp or not shutil.which(args.omp):
-        ap.error(f"omp binary not found: {args.omp!r}")
-    args.omp = os.path.abspath(shutil.which(args.omp))
-    omp_version = subprocess.run([args.omp, "--version"], stdin=subprocess.DEVNULL, capture_output=True,
-                                 text=True).stdout.strip()
-    if args.raw_dir:
-        Path(args.raw_dir).mkdir(parents=True, exist_ok=True)
+    resolved = shutil.which(args.omp) if args.omp else None
+    if resolved is None:
+        ap.error(f"omp executable not found: {args.omp!r}")
+    args.omp = os.path.abspath(resolved)
+    if args.cache_mode != "warm" and args.cache_namespace is not None:
+        ap.error("--cache-namespace is only for warm mode; cold mode creates its own empty databases")
+    if args.raw_dir is None:
+        args.raw_dir = str(Path(args.out).with_suffix("")) + ".raw"
+    Path(args.raw_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        source = source_identity(args.omp, args.omp_source)
+    except (RuntimeError, ValueError) as exc:
+        ap.error(str(exc))
 
-    cases = json.loads(Path(args.cases).read_text())["cases"]
+    payload = json.loads(Path(args.cases).read_text())
+    cases = payload["cases"]
     if args.only:
-        cases = [c for c in cases if c["id"] in set(args.only)]
-    for c in cases:
-        if c.get("expect") not in ("trigger", "no_trigger", "either"):
-            ap.error(f"case {c.get('id')!r}: expect must be trigger, no_trigger or either, not {c.get('expect')!r}")
+        cases = [case for case in cases if case["id"] in set(args.only)]
+    try:
+        for case in cases:
+            validate_case(case)
+        identities = {case["id"]: fixture_identity(case) for case in cases}
+    except (RuntimeError, ValueError, OSError) as exc:
+        ap.error(str(exc))
     with tempfile.TemporaryDirectory(prefix="jevify-eval-") as tmp:
         tmp = Path(tmp)
-        if args.ref:
-            skills_dir = skill_from_ref(args.ref, tmp / "skills")
-        else:
-            skills_dir = Path(args.skill_dir or ROOT / "skills").resolve()
+        try:
+            if args.ref:
+                skills_dir = skill_from_ref(args.ref, tmp / "skills")
+            else:
+                skills_dir = Path(args.skill_dir or ROOT / "skills").resolve()
+            skill = skill_identity(skills_dir, args.arm)
+            if not skill["complete"]:
+                raise RuntimeError("skill arm requires SKILL.md and jevify.py")
+        except RuntimeError as exc:
+            ap.error(str(exc))
         skill_md = skills_dir / "jevify" / "SKILL.md"
         overlay = tmp / "overlay.yml"
         overlay.write_text(overlay_text(args.arm, skills_dir))
-        # In the none arm a skill:// read fails by design, so there is no source to verify.
         desc_probe = description(skill_md)[:60] if args.arm == "skill" else None
         work = tmp / "work"
         work.mkdir()
-        jobs = [(c, k) for c in cases for k in range(1, args.reps + 1)]
+        try:
+            args.cache_seed = freeze_cache_seed(args.cache_namespace, work) if args.cache_mode == "warm" else None
+        except (RuntimeError, ValueError, OSError) as exc:
+            ap.error(str(exc))
+        jobs = [(case, rep) for case in cases for rep in range(1, args.reps + 1)]
         runs = []
         # Each finished run is appended here at once, so a killed runner keeps its evidence.
         partial = Path(args.out + ".partial.jsonl")
@@ -323,59 +1415,98 @@ def main():
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         ex = cf.ThreadPoolExecutor(max_workers=args.jobs)
         try:
-            futs = [ex.submit(run_one, c, k, overlay, desc_probe, args, work) for c, k in jobs]
-            for f in cf.as_completed(futs):
-                r = f.result()
-                runs.append(r)
+            futures = [ex.submit(run_one, case, rep, overlay, desc_probe, args, work) for case, rep in jobs]
+            for future in cf.as_completed(futures):
+                run = future.result()
+                runs.append(run)
                 with partial.open("a") as sink:
-                    sink.write(json.dumps(r) + "\n")
-                print(f"{r['case']:22} r{r['rep']} pass={r['pass']!s:5} infra={r['infra']!s:5} skill={r['skill_read']!s:5} "
-                      f"helpers={r['helpers_loaded']!s:5} judged={r['judged']!s:5} {r['stop']:9} {r['secs']}s "
-                      f"calls={r['calls']} cost={r['usage']['cost']}", flush=True)
+                    sink.write(json.dumps(run) + "\n")
+                adherence_status = run["strategy_adherence"]["status"]
+                print(f"{run['case']:22} r{run['rep']} {run['execution_status']:10} attempts={run['attempts']} "
+                      f"skill={run['skill_read']!s:5} judged={run['judged']!s:5} adherence={adherence_status} "
+                      f"{run['stop']:9} {run['secs']}s calls={run['calls']} "
+                      f"cost={run['accounting']['monetary_status']}", flush=True)
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
             for proc in list(LIVE):
                 kill_tree(proc)
-        runs.sort(key=lambda r: (r["case"], r["rep"]))
+        runs.sort(key=lambda run: (run["case"], run["rep"]))
         result = {
-            "schema": 2, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "schema": RESULT_SCHEMA,
+            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "arm": args.arm,
-            "ref": args.ref or ("skill-dir" if args.skill_dir else "worktree"),
-            "skill_sha256": hashlib.sha256(skill_md.read_bytes()).hexdigest()[:12] if args.arm == "skill" else None,
-            "cases_sha256": hashlib.sha256(Path(args.cases).read_bytes()).hexdigest()[:12],
-            "omp": omp_version, "omp_path": args.omp, "model": args.model or "default-role",
-            "thinking": args.thinking or "configured",
-            "max_time": args.max_time, "max_calls": args.max_calls,
-            "models_seen": sorted({r["model"] for r in runs if r["model"]}),
-            "reps": args.reps, "summary": summarize(runs), "runs": runs,
+            "strategy": args.strategy,
+            "cache_mode": args.cache_mode,
+            "cache_namespace": None if args.cache_namespace is None else str(Path(args.cache_namespace).resolve()),
+            "cache_seed": None if args.cache_seed is None else {
+                **args.cache_seed, "path": str(args.cache_seed["path"]), "retained": False},
+            "skill_source": args.ref or ("skill-dir" if args.skill_dir else "worktree"),
+            "skill_bundle_label": args.skill_bundle_label,
+            "skill": skill,
+            "cases_path": str(Path(args.cases).resolve()),
+            "cases_schema": payload.get("schema"),
+            "cases_sha256": digest_bytes(Path(args.cases).read_bytes()),
+            "fixture_identities": identities,
+            "method_settings": {
+                "helper_concurrency": HELPER_CONCURRENCY,
+                "backend_retries": BACKEND_RETRIES,
+                "shared_deadline_seconds": SHARED_DEADLINE_SECONDS,
+                "grouped_k": GROUPED_K,
+                "evidence_class": "prescribed_method_settings_not_execution_proof",
+            },
+            "source": source,
+            "omp": source["executable"]["version"],
+            "omp_path": source["executable"]["path"],
+            "model_requested": args.model or "default-role",
+            "thinking_requested": args.thinking or "configured",
+            "max_time": args.max_time,
+            "max_calls": args.max_calls,
+            "session_flags": list(SESSION_FLAGS),
+            "usage_source": "isolated_persisted_session_model_usage",
+            "session_retention": "temporary_until_process_settlement_then_accounting_projection_only",
+            "tools": TOOLS.split(","),
+            "models_seen": sorted({run["model"] for run in runs if run["model"]}),
+            "thinking_seen": sorted({run["thinking"] for run in runs if run["thinking"]}),
+            "reps": args.reps,
+            "raw_dir": str(Path(args.raw_dir).resolve()),
+            "summary": summarize(runs),
+            "cost_ledger": merge_accounting([run["accounting"] for run in runs]),
+            "runs": runs,
+            "grading_cost": {"measured": False, "reported_cost": None,
+                             "notes": ["Grade this execution artifact separately; do not copy its cost per arm."]},
         }
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(result, indent=1) + "\n")
-    s = result["summary"]
-    print(f"\nauto_trigger {s['auto_trigger']} · auto_judged {s['auto_judged']} · false_trigger {s['false_trigger']} · "
-          f"keyword {s['keyword']} · either {s['either']} · infra {s['infra_failures']} · eval_errors {s['eval_errors']} · "
-          f"skill_source_mismatch {s['skill_source_mismatch']} · mean_secs {s['mean_secs']} · mean_cost {s['mean_cost']}")
-    print(f"arm {result['arm']} · {result['omp']} ({result['omp_path']})")
+    summary = result["summary"]
+    print(f"\nauto_trigger {summary['auto_trigger']} · auto_judged {summary['auto_judged']} · "
+          f"judged_unverified {summary['auto_judged_unverified']} · "
+          f"false_trigger {summary['false_trigger']} · keyword {summary['keyword']} · either {summary['either']} · "
+          f"infra {summary['infra_failures']} · failed_or_incomplete {summary['failed_or_incomplete']} · "
+          f"strategy_violations {summary['strategy_violations']}")
+    print(f"arm {result['arm']} · strategy {result['strategy']} · cache {result['cache_mode']} · "
+          f"cost {result['cost_ledger']['monetary_status']} · source {source['status']}")
+    print(f"executable {result['omp_path']} version={result['omp'] or 'unknown'}")
     if args.compare:
         base = json.loads(Path(args.compare).read_text())
         if base.get("cases_sha256") != result["cases_sha256"]:
             print("warning: case file differs from the baseline; comparison is not one-variable")
-        base_setup = {"omp": base.get("omp"), "arm": base.get("arm", "skill")}  # schema 1 had no arm
-        diffs = [f"{k} {v} -> {result[k]}" for k, v in base_setup.items() if v != result[k]]
+        base_setup = {"arm": base.get("arm", "skill"), "strategy": base.get("strategy", "auto")}
+        diffs = [f"{key} {value} -> {result[key]}" for key, value in base_setup.items() if value != result[key]]
         if diffs:
             print("note: baseline differs in " + "; ".join(diffs))
-        bs = base["summary"]
-        print(f"baseline auto_trigger {bs['auto_trigger']} · auto_judged {bs.get('auto_judged', '?')} · "
-              f"false_trigger {bs['false_trigger']} · keyword {bs['keyword']} · either {bs.get('either', '?')}")
-        if base.get("schema", 1) < 2:
-            print("note: baseline is schema 1 (sessions stopped early at the first judge call)")
-        print(f"  {'case':22} pass    judged   (baseline pass / judged)")
-        for cid, c in sorted(s["per_case"].items()):
-            b = bs["per_case"].get(cid)
-            line = f"  {cid:22} {c['pass']}/{c['n']}     {c['judged']}/{c['n']}"
-            if b:
-                line += f"      ({b['pass']}/{b['n']} / {b.get('judged', '?')}/{b['n']})"
-            print(line)
+        base_summary = base["summary"]
+        print(f"baseline auto_trigger {base_summary['auto_trigger']} · "
+              f"auto_judged {base_summary.get('auto_judged', '?')} · "
+              f"false_trigger {base_summary['false_trigger']} · keyword {base_summary['keyword']} · "
+              f"either {base_summary.get('either', '?')}")
+        if base.get("schema", 1) < RESULT_SCHEMA:
+            print(f"note: baseline is schema {base.get('schema', 1)}; its execution evidence contract differs")
+        print(f"  {'case':22} pass    judged   adherence")
+        for case_id, case in sorted(summary["per_case"].items()):
+            print(f"  {case_id:22} {case['pass']}/{case['n']}     "
+                  f"{case['judged']}/{case['n'] - case['judged_unverified']} "
+                  f"({case['judged_unverified']} unverified)     "
+                  f"{case['strategy_adherence_pass']}/{case['strategy_adherence_scored']}")
 
 
 if __name__ == "__main__":

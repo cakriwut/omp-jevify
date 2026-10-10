@@ -14,11 +14,17 @@ call sites. Scale 1 is byte-identical to the fixture of every recorded result.
 
 answer_keys(root) derives the ground truth that evals/grade.py scores final answers against,
 at whatever scale root was built.
+
+dataset="refund_retry" (scale 1 only) selects a separate review fixture with schema2 keys
+that keep factual status, warranted action and introduced behavior apart; see
+evals/refund_retry_fixture.py. The default dataset, "billing", is unchanged.
 """
 
 import ast
 from datetime import datetime, timedelta, timezone
+import functools
 import json
+import importlib.util
 import random
 import re
 import subprocess
@@ -192,7 +198,23 @@ def _module(name, rounded, drift):
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build(root, scale=1):
+@functools.cache
+def _dataset(name):
+    spec = importlib.util.spec_from_file_location(
+        f"jevify_eval_{name}", Path(__file__).with_name(f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build(root, scale=1, *, dataset="billing"):
+    if dataset == "refund_retry":
+        build_refund_retry = _dataset("refund_retry_fixture").build
+        if scale != 1:
+            raise ValueError("refund_retry supports only scale=1")
+        return build_refund_retry(root)
+    if dataset != "billing":
+        raise ValueError(f"unknown dataset {dataset!r}")
     if not isinstance(scale, int) or not 1 <= scale <= MAX_SCALE:
         raise ValueError(f"scale must be an integer from 1 to {MAX_SCALE}, not {scale!r}")
     root = Path(root)
@@ -612,8 +634,11 @@ def _scaled_truth(scale, source):
     }
 
 
-def answer_keys(root):
+def answer_keys(root, *, dataset="billing"):
     """Ground truth for grading final answers, computed from the fixture repository at root.
+
+    dataset="refund_retry" returns {"refund_retry_findings": schema2 key} from
+    refund_retry_fixture.answer_keys(); everything below describes the default billing keys.
 
     Returns {key: {"question", "flag_label", "items": [{"id", "desc", "flag"}]}}. flag is True
     or False, or None where the truth is genuinely debatable; evals/grade.py judges and scores
@@ -703,6 +728,10 @@ def answer_keys(root):
       something the docstring does not mention (half_up, abs, skip_fx, the 1.0 fallback, a
       hard-coded USD rate).
     """
+    if dataset == "refund_retry":
+        return {"refund_retry_findings": _dataset("refund_retry_fixture").answer_keys()}
+    if dataset != "billing":
+        raise ValueError(f"unknown dataset {dataset!r}")
     root = Path(root)
 
     def blob(path):

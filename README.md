@@ -1,29 +1,37 @@
 # omp-jevify
 
 An [Oh My Pi](https://github.com/can1357/oh-my-pi) plugin that ships one skill, `jevify`:
-rubric-first bulk classification in the eval kernel with `judge_batch` (Jev).
+method-first suitability guidance and optional rubric-based classification in the eval
+kernel with `judge_batch` (Jev).
 
-Write the questions first, pull out every item, try the questions on a small sample, then
-freeze them and let Jev judge every item in one complete pass. Check the result against
-a slower model, then act only on flagged items. It generalises Can Bölük's Jevict
-([thread](https://x.com/_can1357/status/2102524777776677104)) beyond test pruning:
+Choose the method before judging:
 
-- does each changed section of a commit or PR match its stated purpose
-- which call sites still need changing after a refactor
-- triage of compiler diagnostics, sanitized logs and review findings
-- test pruning (use a `jevict` skill for the full rubric, if you have one)
-- turning a frozen rubric into a check that runs while code is written
+- Prefer a compiler, search, AST rule or short script when a deterministic rule decides
+  the answer.
+- Prefer direct reading for small jobs or tightly cross-dependent reasoning.
+- Consider Jev for repeated, independently judgeable semantic decisions with sufficient
+  context, such as whether changed hunks match a stated contract or review findings
+  match the cited code.
 
-Use it for roughly 20+ similar items, each needing the same question answered. Scores are
-one model's verdicts, not proof: read flagged items before acting on them.
+There is no item-count mandate. Loading the skill, repeating a task or explicitly asking
+for Jev does not make judgment the right method. When choosing Jev, define and pilot the
+rubric, freeze it, then cover the declared scope. Read flagged sources and resolve errors,
+unknowns and coverage gaps before claiming closure. Calibrate before bulk or destructive
+action; read-only calibration is optional. Scores and model agreement are not proof or
+permission to edit. It generalises Can Bölük's Jevict
+([thread](https://x.com/_can1357/status/2102524777776677104)) beyond test pruning.
 
 ## Install
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-jevify.git#v0.1.4'
+omp plugin install 'git+https://github.com/ericjuta/omp-jevify.git#v0.2.0'
 ```
 
-Start a new OMP session afterwards. There is nothing else to set up:
+The install command pins the published tag. The helper and eval contracts below
+describe this checked-out source; local changes and the separate host companion
+patch are not made available by reinstalling that tag.
+
+Start a new OMP session afterwards:
 
 - Ask for the kind of job it is for ("go through every changed hunk in this commit and tell
   me which aren't explained by the message", "check every call site of X…") and the model
@@ -32,17 +40,32 @@ Start a new OMP session afterwards. There is nothing else to set up:
   its own instructions for that turn, and the skill is picked up alongside.
 - Or type `/skill:jevify` to inject it directly.
 
+Stock OMP 18.8.7 still injects an item-count-based mandatory `jevify` keyword notice
+that conflicts with this skill's method-first guidance. Installing the plugin alone
+does not change that host notice. The separate, unreleased local companion host patch
+targets method-first guidance: Jev stays optional, there is no size requirement, and
+context gathering is allowed before choosing the method.
+
 The model loads the helpers itself; by hand, in the Python eval kernel:
 
 ```python
 %load skill://jevify/jevify.py
 ```
 
-This defines `jv` (extraction from diffs, `rg` and ast-grep; batch runs with a retry;
-Jev-token state sizing; error and non-primary-model flags; slow-model calibration;
-dry-run-by-default span deletion).
-See [`skills/jevify/SKILL.md`](skills/jevify/SKILL.md) for the workflow, the exact `jv` API,
-measured harness facts and recipes.
+This defines `jv` (extraction from diffs, `rg` and ast-grep; batch handling;
+Jev-token state sizing; error, fallback and unknown-provenance flags; slow-model
+calibration; dry-run-by-default span deletion).
+See [`skills/jevify/SKILL.md`](skills/jevify/SKILL.md) for suitability and workflow;
+read [`skills/jevify/reference.md`](skills/jevify/reference.md) on demand for helper APIs
+and recipes.
+
+### Provenance is not inferred
+
+Stock OMP 18.8.7 exposes only `key`, `answers`, `error` and `model` on judgment items.
+It does not expose selected/response model, fallback or cache-hit provenance. The helper
+marks missing provenance `provenance_unknown`; a model label or a change in that label
+does not establish fallback or a cache hit. Treat unknown provenance as unresolved,
+not as evidence that the primary model answered.
 
 ## Requirements
 
@@ -53,87 +76,111 @@ measured harness facts and recipes.
 - `uv` (or pip) for `jv.ast_units`, which installs `ast-grep-py` on first use into
   `${XDG_CACHE_HOME:-~/.cache}/jevify/` (the kernel's Python may have no pip).
 
-## Development
+## Development and evals
 
-`python3 -m unittest discover -s tests` runs the helper and answer-key tests (no model calls;
-needs `git`, `rg`, and `uv` for the ast-grep test). CI runs them on every push.
+Local tests: `python3 -m unittest discover -s tests`.
 
-`evals/run.py` measures whether the skill triggers and saves each session's answer. Each case
-in `evals/cases.json` runs as a fresh `omp --mode json` session in a generated fixture
-repository (`evals/fixture.py`); prompts state a goal and never name the skill. A one-shot
-`--config` overlay sets the arm for that process only, so the installed plugin does not
-interfere: `--arm skill` (default) pins the skill under test, `--arm none` hides jevify and
-leaves every other skill available. `--omp` picks the `omp` binary (default: the one on
-`PATH`); `--thinking` pins the thinking level (default: the configured one).
+`evals/run.py` runs bounded OMP sessions in generated fixture repositories. Skill
+availability and requested method are separate controls:
+
+- `--arm skill` (default) pins the tested skill bundle; `--arm none` hides jevify.
+- `--strategy auto` (default) leaves the case goal unchanged. `direct-script`,
+  `jev-flat` and `jev-grouped` append method instructions, not expected answers.
+- `--ref` tests a Git revision's skill directory; `--skill-dir` tests another complete
+  bundle. With neither, the runner uses the working-tree skill.
+- `--omp` selects the executable; `--omp-source` records a supplied source checkout's
+  identity separately. `--model` and `--thinking` select the subject configuration.
+- `--reps`, `--jobs`, `--max-time`, `--max-calls` and `--retries` bound execution.
+
+Model runs require model access and spend real tokens. Opening the skill is activation
+evidence, not evidence that classification was suitable or that an answer was correct.
+Explicit strategies measure requested-method adherence separately from answer quality.
+
+## Evaluation evidence and cache controls
+
+Execution results use schema 4, distinct from grading and answer-key schemas. They
+record skill/source, cases and fixture identities; requested configuration; `runs`;
+`summary`; and a `cost_ledger`. Runs retain `attempt_records`, including failed or
+retried attempts, captured answers, execution status and strategy adherence. Completed
+runs are appended to `<out>.partial.jsonl`; raw artifacts are kept beside the output
+unless `--raw-dir` selects another location.
+
+The runner starts each attempt with a private `--session-dir` and reads persisted
+session JSONL `type: model_usage` entries after the process settles. It does not depend
+on a `model_usage_summary` print event. The retained ledger is an accounting-only
+projection; the transient full session is deleted after collection. Outer assistant
+usage and auxiliary usage remain separate. `snapshot_statuses` and `collection_status`
+describe collection completeness, not overall billing coverage. Stock OMP 18.8.7 does
+not journal eval `completion` calls in this ledger. Even a complete file containing
+judge rows cannot establish zero completion cost or a complete execution total.
+Completion, auxiliary and total buckets retain `coverage_unknown: true`,
+`cost_unknown: true` and null `reported_cost`, including after attempts are merged.
+`reported_subtotal` and token sums count only observed rows; a zero subtotal is not
+proof of free execution, and unknown coverage leaves `tokens_complete` false.
+Observed costs remain estimates unless attested otherwise. Unknown costs remain
+unknown, not zero; execution accounting does not include grading overhead.
+
+`judged` can be unknown. `auto_judged` uses only known observations in its denominator;
+`auto_judged_unverified` reports the excluded unknowns. Fully cached judging may produce
+no billed usage rows, so an empty ledger does not prove that no judgment occurred.
+Helper receipts and source markers are not host-attested execution evidence. These
+limits also constrain strategy-adherence claims.
+
+### Cache controls
+
+The host's default judgment cache is shared, not session-local. The runner provides:
+
+- `--cache-mode cold` (default): a fresh, independent `OMP_JUDGMENT_CACHE_DB` for each
+  attempt, including retries. No seed path is accepted.
+- `--cache-mode warm --cache-namespace /path/to/seed.sqlite`: a read-only SQLite backup
+  of an existing seed, including committed WAL contents, frozen once per eval invocation.
+  Each attempt gets an independent writable clone of that snapshot. The runner records
+  its starting fingerprint and does not judge against or update the original seed.
+  A seed's existence does not prove cache hits.
+- `--cache-mode uncontrolled`: use host cache state without asserting isolation.
+
+For comparisons across invocations, keep the seed stable and compare the recorded seed
+fingerprints. Do not hash only the main file of a live WAL database or let arms share a
+single growing writable cache.
 
 ```sh
-python3 evals/run.py --ref v0.1.0 --out /tmp/base.json          # a released version
-python3 evals/run.py --out /tmp/cand.json --compare /tmp/base.json   # working tree
-python3 evals/run.py --arm none --omp /path/to/omp --thinking low --out /tmp/none.json
+python3 evals/run.py --arm skill --strategy auto --cache-mode cold --jobs 1 --out /tmp/cand.json
+python3 evals/run.py --arm none --strategy auto --cache-mode cold --jobs 1 --out /tmp/none.json --compare /tmp/cand.json
 ```
 
-A case may set `"scale": N` (default 1) to run in a larger fixture: `fixture.build(root,
-scale=N)`, for N up to 16, tells the same story N times over. It has 7N billing modules whose
-28N line items the rounding fix all touches, and unexplained drift in about 4% of HEAD's hunks,
-varied so that no shared token or grep finds it. It also has 28N review findings, each citing a
-function, whose validity depends on that function's code, 400N log lines with 5 + 3N kinds of
-ERROR/WARN line (about 18% of them real bugs), and 28N `fetch_rate` call sites. Scale 1 is
-byte-identical to the fixture behind every recorded result. `evals/cases-large.json` runs at
-scale 12, where reading every item directly is costly: about 340 hunks (a 149 KB, roughly
-43k-token `git show HEAD`), 336 findings and 4,800 log lines. Running both arms on it compares
-correctness, time and cost:
+For an explicitly requested flat-method run against an existing seed:
 
 ```sh
-python3 evals/run.py --cases evals/cases-large.json --arm skill --max-time 900 --max-calls 60 --out /tmp/large-skill.json
-python3 evals/run.py --cases evals/cases-large.json --arm none --max-time 900 --max-calls 60 --out /tmp/large-none.json
+python3 evals/run.py --arm skill --strategy jev-flat --cache-mode warm --cache-namespace /path/to/seed.sqlite --jobs 1 --out /tmp/warm-flat.json
 ```
 
-A case with `"expect": "either"` is a control whose trigger is not scored (`callsite_sweep_large`:
-one `rg` answers it, with or without the skill). It passes whatever the model does, is
-reported as its own `either` count outside `auto_trigger` and `false_trigger`, and its answer
-is still graded.
+`--compare` prints an informational comparison, not a controlled quality verdict.
+Check source, cases, fixtures, model configuration, cache identities, execution status
+and unknown evidence before interpreting differences. Execution results do not grade
+answer correctness.
 
-Results are schema 2: each run records its final `answer`, token `usage` with cost, `secs`,
-`calls`, `skill_read` and `judged`; the file records `arm`, `omp` and `thinking`. Each
-finished run is also appended at once to `<out>.partial.jsonl`, so a killed runner keeps its
-evidence.
+### Grading and evidence limits
 
-`evals/holdout.json` is a sealed set of 12 differently worded prompts (7 should trigger,
-5 should not), written by a separate agent that never saw the skill or `cases.json`. Do not
-read or edit it while tuning `SKILL.md`; run it only to check a candidate
-(`--cases evals/holdout.json`). Once someone tunes against it, it stops being a holdout
-and should be replaced.
-
-It needs model access, costs real tokens and varies run to run, so it is run by hand
-before releases that change `SKILL.md`, not in CI. Recorded results live in
-`evals/results/`. Reported rates:
-
-- `auto_trigger`: goal-only prompts that should use the skill and opened it
-- `auto_judged`: of those, how many went on to run a judge batch
-- `false_trigger`: prompts that should not use it (summaries, counts, a single-file review,
-  a rename, an explanation) but opened it
-- `keyword`: the `jevify` keyword case, reported separately
-- `either`: controls whose trigger is not scored, reported for reference
-- `infra`: sessions with no tool call and no answer after one retry (provider or host
-  trouble), excluded from the rates
-
-Each case's `key` names an answer key that `fixture.answer_keys` derives from the fixture
-built at the case's scale (`null`: not graded; one fixture per distinct scale).
-`evals/grade.py` scores saved answers in OMP's Python eval kernel: Jev
-judges each key item as flagged, cleared or not mentioned by the answer, and every run gets
-recall, precision and false flags (an empty answer scores recall 0; judge errors are counted
-per run). Debatable items (`flag: null`) are not scored. Several files, or a
-`.partial.jsonl`, can be graded in one judge batch; each gets a table and a `.graded.json`.
+`evals/grade.py` grades saved answers in OMP's Python eval kernel. Schema-2 answer keys
+separate factual truth, action under the public policy and origin; historical Boolean
+keys remain separate. Grading outputs use schema 2 and reference a shared grading-cost
+ledger, rather than adding grading overhead to each execution arm. Batch costs are
+estimates; grading-session outer cost and total billing remain unmeasured/unknown,
+even for zero-cost or empty batches. Its cache-mode argument records intent; the
+grading session must configure its own cache.
 
 ```python
 %load evals/grade.py
-await grade("/tmp/cand.json", "evals/cases.json")   # writes /tmp/cand.graded.json
-await grade(["/tmp/skill.json", "/tmp/none.json"], "evals/holdout.json")
+await grade("/tmp/cand.json", "evals/cases.json")
 ```
 
-Verdicts are one model's. On synthetic answers about 1 item in 200 was misjudged, always as
-a false flag on a look-alike of a flagged item (same file, same line number in another file,
-or same claim).
+Use the same case file that produced the captured answers. Omissions and extraction
+failures remain visible; model-extracted assertions are not independent quality proof.
+Recorded artifacts in `evals/results/` describe their captured revisions and conditions,
+not current quality guarantees.
+
+`evals/holdout.json` is sealed. Do not read or edit its prompts while tuning the skill
+or eval machinery. Once used for tuning, it is no longer a holdout.
 
 ## License
 

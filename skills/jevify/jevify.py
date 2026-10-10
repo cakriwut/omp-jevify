@@ -23,6 +23,14 @@ import tempfile as _jv_tempfile
 import time as _jv_time
 
 
+class _JvRows(list):
+    """Rows with the receipt from their own run, including runs with no returned rows."""
+
+    def __init__(self, rows=(), *, receipt=None):
+        super().__init__(rows)
+        self.receipt = receipt
+
+
 class jv:
     CAP = 12_000
     MAX_JEV = 32_000  # Jev tokens; 32.6k-token states judged, 33.1k failed max_tokens_exceeded.
@@ -527,16 +535,19 @@ class jv:
 
     @classmethod
     def group(cls, units, *, by, k=8, render=None, shared=None, cap=None):
+        """Return bounded group states and an explicit original/slot/exclusion manifest."""
         if k < 1:
             raise ValueError("k must be positive")
         ceiling = cls.CAP if cap is None else cap
         if ceiling <= 0:
             raise ValueError("cap must be positive")
-        buckets = {}
+        buckets, excluded = {}, {}
         for identifier, unit in units.items():
             value = render(unit) if render else unit
             if cls._nonempty(value):
                 buckets.setdefault(by(unit), []).append((identifier, value))
+            else:
+                excluded[identifier] = "empty rendered unit"
         groups, slots = {}, {}
         for key, members in buckets.items():
             for start in range(0, len(members), k):
@@ -550,7 +561,10 @@ class jv:
                 groups[identifier] = state
                 slots[identifier] = [uid for uid, _ in part]
         bounded = cls.states(groups, cap=ceiling)
-        return bounded, {gid: slots[gid] for gid in bounded}
+        for gid in groups.keys() - bounded.keys():
+            excluded.update({uid: "empty group state" for uid in slots[gid]})
+        return bounded, {"original_ids": list(units),
+                         "slots": {gid: slots[gid] for gid in bounded}, "excluded": excluded}
 
     @classmethod
     def sample(cls, states, n=60, *, seed=None):
@@ -590,10 +604,12 @@ class jv:
     @classmethod
     async def _collect(cls, payload, questions, required, *, intent, concurrency, retries, deadline):
         found, problem, cost = {}, "no result delivered", 0.0
+        evidence = {"batch_id": None, "planned_ids": list(payload), "coverage_errors": []}
         batch = None
         try:
             batch = globals()["judge_batch"](payload, questions, concurrency=concurrency,
                                                retries=retries, intent=intent)
+            evidence["batch_id"] = getattr(batch, "id", None)
             while True:
                 remaining = deadline - _jv_time.monotonic()
                 if remaining <= 0:
@@ -601,7 +617,11 @@ class jv:
                     break
                 try:
                     async for identifier, item in batch.drain_iter(min(60, remaining)):
-                        if identifier in payload:
+                        if identifier not in payload:
+                            evidence["coverage_errors"].append(f"unexpected host key: {identifier}")
+                        elif identifier in found:
+                            evidence["coverage_errors"].append(f"duplicate host key: {identifier}")
+                        else:
                             found[identifier] = item
                 except Exception as error:
                     problem = f"judge drain failed: {error}"
@@ -611,12 +631,14 @@ class jv:
                 if isinstance(raw_cost, (int, float)):
                     cost = float(raw_cost)
                 print(f"jevify {intent}: {status.get('done', len(found))}/{status.get('total', len(payload))} "
-                      f"done · {status.get('failed', 0)} failed · primary-priced cost={cost:.6g} "
+                      f"done · {status.get('failed', 0)} failed · batch cost estimate={cost:.6g} "
                       f"· elapsed={status.get('elapsedS', 0):.1f}s")
                 if status.get("done", 0) >= len(payload) or not status.get("running", False):
                     break
             status = batch.status()
             raw_cost = status.get("cost", 0)
+            if evidence["batch_id"] is None:
+                evidence["batch_id"] = status.get("id")
             if isinstance(raw_cost, (int, float)):
                 cost = float(raw_cost)
         except Exception as error:
@@ -628,7 +650,22 @@ class jv:
                         batch.cancel()
                 finally:
                     batch.close()
-        return found, problem, cost
+        if batch is not None and not evidence["batch_id"]:
+            evidence["coverage_errors"].append("host batch ID missing")
+        evidence["answered_ids"] = [key for key, item in found.items()
+                                    if cls._item_good(item, questions, required[key])]
+        evidence["error_ids"] = [key for key in payload if key not in evidence["answered_ids"]]
+        evidence["cost_estimate"] = cost
+        # Retain one item per delivered planned host key, not one per expanded group slot.
+        # Missing metadata is unknown; neither display models nor billed usage fill it in.
+        evidence["items"] = [
+            {"id": key, "batch_id": evidence["batch_id"], **{
+                field: getattr(item, field, None) for field in (
+                    "selected_model", "primary_model", "response_model", "fallback",
+                    "cache", "questions", "cached_questions")}}
+            for key, item in found.items()
+        ]
+        return found, problem, cost, evidence
 
     @staticmethod
     def _oversize(item):
@@ -668,12 +705,34 @@ class jv:
         else:
             raise ValueError(f"unknown question type: {kind}")
 
+    @staticmethod
+    def _provenance_unknown(row):
+        selected, primary = row.get("selected_model"), row.get("primary_model")
+        fallback = row.get("fallback")
+        cache, total, cached = row.get("cache"), row.get("questions"), row.get("cached_questions")
+        if (row.get("provenance_unknown") or not isinstance(selected, str) or not selected
+                or not isinstance(primary, str) or not primary or type(fallback) is not bool
+                or fallback != (selected != primary)):
+            return True
+        if (cache not in ("hit", "partial", "miss") or type(total) is not int or total < 1
+                or type(cached) is not int or not 0 <= cached <= total):
+            return True
+        return not ((cache == "hit" and cached == total)
+                    or (cache == "miss" and cached == 0)
+                    or (cache == "partial" and 0 < cached < total))
+
     @classmethod
-    def _flat_row(cls, identifier, Q, item, digest, *, slot=None, group=None, failure=None):
-        model = getattr(item, "model", None) if item is not None else None
-        row = {"id": identifier, "model": model, "qhash": digest}
+    def _flat_row(cls, identifier, Q, item, digest, *, slot=None, group=None, failure=None,
+                  batch_id=None):
+        row = {"id": identifier, "model": getattr(item, "model", None), "qhash": digest,
+               "batch_id": batch_id}
+        for field in ("selected_model", "primary_model", "fallback", "response_model", "cache",
+                      "questions", "cached_questions"):
+            row[field] = getattr(item, field, None)
+        row["provenance_unknown"] = cls._provenance_unknown(row)
         if group is not None:
             row["group"] = group
+            row["slot"] = f"s{slot}"
         if failure is not None:
             row["error"] = failure
             return row
@@ -686,25 +745,85 @@ class jv:
                 key = qid if slot is None else f"{qid}@s{slot}"
                 cls._answer(row, qid, question, item.answers[key])
         except (KeyError, TypeError, ValueError, OverflowError) as error:
-            row = {"id": identifier, "model": model, "qhash": digest}
-            if group is not None:
-                row["group"] = group
+            # Keep route/cache evidence, but never expose a partially decoded verdict as success.
+            for qid, question in Q.items():
+                row.pop(qid, None)
+                row.pop(f"{qid}.conf", None)
+                for label in question.get("criteria", {}):
+                    row.pop(f"{qid}.{label}", None)
             row["error"] = f"invalid judge answer: {error}"
         return row
 
+    @staticmethod
+    def _validate_columns(Q):
+        # Answers stay flat, so every emitted column must have a single owner.
+        columns = {field: "helper metadata" for field in (
+            "id", "model", "qhash", "batch_id", "selected_model", "primary_model",
+            "fallback", "response_model", "cache", "questions", "cached_questions",
+            "provenance_unknown", "group", "slot", "error", "why",
+            "coverage_complete", "coverage_errors")}
+        for qid, question in Q.items():
+            names = [qid]
+            if question["type"] == "choice":
+                names.extend(f"{qid}.{label}" for label in question["criteria"])
+            if question["type"] in ("choice", "score"):
+                names.append(f"{qid}.conf")
+            for name in names:
+                if name in columns:
+                    raise ValueError(f"answer column {name!r} for question {qid!r} "
+                                     f"collides with {columns[name]}")
+                columns[name] = f"question {qid!r}"
+
     @classmethod
-    async def run(cls, states, Q, *, intent, concurrency=32, retries=1, timeout=1800, slots=None):
+    async def run(cls, states, Q, *, intent, concurrency=32, retries=1, timeout=1800, grouping=None,
+                  receipt_path=None):
+        """Judge states and return list-compatible rows bound to their own rows.receipt.
+
+        Grouped runs require the full manifest returned by group(), not just its slots.
+        The receipt is also retained in stats['runs'] and optionally written to receipt_path.
+        Its cost is a batch estimate; the host model-usage ledger accounts for all attempts.
+        """
         if not isinstance(intent, str) or not intent.strip():
             raise ValueError("run requires a non-empty intent")
         if timeout <= 0 or concurrency < 1:
             raise ValueError("timeout and concurrency must be positive")
+        Q = _jv_copy.deepcopy(Q)
+        cls._validate_columns(Q)
+        states = dict(states)
         digest = cls.qhash(Q)
         if cls.frozen is not None and cls.frozen != digest:
             print(f"WARNING: question hash {digest} differs from last frozen {cls.frozen}: in the same "
                   "sweep the wording drifted, so re-judge every unit; a new sweep should freeze its own Q")
-        if slots is not None:
-            if set(states) != set(slots) or any(not ids for ids in slots.values()):
+        slots, exclusions = None, {}
+        original_ids = unit_ids = list(states)
+        if grouping is not None:
+            if (not isinstance(grouping, dict)
+                    or set(grouping) != {"original_ids", "slots", "excluded"}):
+                raise ValueError("grouping requires original_ids, slots, and excluded")
+            grouping = _jv_copy.deepcopy(grouping)
+            original_ids, slots, exclusions = (grouping["original_ids"], grouping["slots"],
+                                               grouping["excluded"])
+            if (not isinstance(original_ids, list)
+                    or any(not isinstance(uid, str) for uid in original_ids)
+                    or len(set(original_ids)) != len(original_ids)):
+                raise ValueError("grouping original_ids must be unique string IDs")
+            if (not isinstance(slots, dict) or set(states) != set(slots)
+                    or any(not isinstance(ids, list) or not ids for ids in slots.values())):
                 raise ValueError("slots must name every nonempty group state exactly once")
+            unit_ids = [uid for ids in slots.values() for uid in ids]
+            if any(not isinstance(uid, str) for uid in unit_ids) or len(set(unit_ids)) != len(unit_ids):
+                raise ValueError("slots must map each original unit ID exactly once")
+            if (not isinstance(exclusions, dict)
+                    or any(not isinstance(uid, str) or not isinstance(reason, str) or not reason.strip()
+                           for uid, reason in exclusions.items())
+                    or set(unit_ids) & set(exclusions)
+                    or set(unit_ids) | set(exclusions) != set(original_ids)):
+                raise ValueError("grouping must account for every original ID once in slots or excluded")
+            for gid, ids in slots.items():
+                state = states[gid]
+                units = state.get("units") if isinstance(state, dict) else None
+                if not isinstance(units, dict) or set(units) != {f"s{i}" for i in range(len(ids))}:
+                    raise ValueError(f"slots do not match actual state.units for group {gid}")
             questions = cls.slot_questions(Q, max(map(len, slots.values()))) if slots else {}
             required = {gid: [f"{qid}@s{i}" for i in range(len(ids)) for qid in Q]
                         for gid, ids in slots.items()}
@@ -717,23 +836,38 @@ class jv:
         deadline = start + timeout
         first, first_problem, first_cost = {}, "no result delivered", 0.0
         second, second_problem, second_cost = {}, "no result delivered", 0.0
+        first_evidence, second_evidence = {}, {}
+        batches = []
         retried = set()
         if states:
-            first, first_problem, first_cost = await cls._collect(
+            first, first_problem, first_cost, first_evidence = await cls._collect(
                 states, questions, required, intent=intent, concurrency=concurrency,
                 retries=retries, deadline=deadline)
+            batches.append(first_evidence)
             # A state over Jev's context fails identically on every attempt; retry only the rest.
             pending = {key: state for key, state in states.items()
                        if key not in first or not (cls._item_good(first[key], questions, required[key])
                                                    or cls._oversize(first[key]))}
             if pending and _jv_time.monotonic() < deadline:
                 retried = set(pending)
-                second, second_problem, second_cost = await cls._collect(
+                second, second_problem, second_cost, second_evidence = await cls._collect(
                     pending, questions, required, intent=intent + " (retry)",
                     concurrency=concurrency, retries=retries, deadline=deadline)
-        rows = []
+                batches.append(second_evidence)
+        rows = _JvRows()
+        cache_counts = {"hit": 0, "partial": 0, "miss": 0, "unknown": 0}
+        question_count, cached_count, counts_unknown = 0, 0, 0
         for key in states:
             item = second.get(key) if key in retried else first.get(key)
+            evidence = second_evidence if key in retried else first_evidence
+            cache = getattr(item, "cache", None)
+            cache_counts[cache if cache in ("hit", "partial", "miss") else "unknown"] += 1
+            total, cached = getattr(item, "questions", None), getattr(item, "cached_questions", None)
+            if type(total) is int and type(cached) is int and 0 <= cached <= total:
+                question_count += total
+                cached_count += cached
+            else:
+                counts_unknown += 1
             issue = second_problem if key in retried else first_problem
             failure = None if item is not None else issue
             if item is not None and not cls._item_good(item, questions, required[key]):
@@ -741,40 +875,76 @@ class jv:
                 if cls._oversize(item):
                     failure = f"oversize: Jev max_tokens_exceeded; shrink or split this state ({failure[:400]})"
             if slots is None:
-                rows.append(cls._flat_row(key, Q, item, digest, failure=failure))
+                rows.append(cls._flat_row(key, Q, item, digest, failure=failure,
+                                          batch_id=evidence.get("batch_id")))
             else:
                 for index, identifier in enumerate(slots[key]):
                     rows.append(cls._flat_row(identifier, Q, item, digest, slot=index,
-                                              group=key, failure=failure))
+                                              group=key, failure=failure,
+                                              batch_id=evidence.get("batch_id")))
         models = _jv_collections.Counter(str(row["model"]) for row in rows if row["model"] is not None)
         errors = sum("error" in row for row in rows)
         elapsed = _jv_time.monotonic() - start
         cost = first_cost + second_cost
-        summary = {"intent": intent, "units": len(rows), "ok": len(rows) - errors,
+        coverage_errors = [error for batch in batches for error in batch["coverage_errors"]]
+        summary = {"schema": 2, "strategy": "jev-grouped" if slots is not None else "jev-flat",
+                   "intent": intent, "units": len(rows), "ok": len(rows) - errors,
                    "errors": errors, "models": dict(models), "cost": cost,
-                   "elapsed": elapsed, "qhash": digest}
+                   "cost_kind": "batch_estimate", "elapsed": elapsed, "qhash": digest,
+                   "question_hash": digest, "frozen_question_hash": cls.frozen,
+                   "batch_ids": [batch["batch_id"] for batch in batches if batch["batch_id"]],
+                   "batches": batches,
+                   "unit_ids": unit_ids, "original_ids": original_ids,
+                   "excluded_ids": [uid for uid in original_ids if uid in exclusions],
+                   "exclusions": exclusions,
+                   "answered_ids": [row["id"] for row in rows if "error" not in row],
+                   "error_ids": [row["id"] for row in rows if "error" in row],
+                   "error_details": {row["id"]: row["error"] for row in rows if "error" in row},
+                   "group_sizes": [] if slots is None else [len(ids) for ids in slots.values()],
+                   "group_slots": {} if slots is None else slots,
+                   "coverage_errors": coverage_errors,
+                   "complete": not errors and not coverage_errors and not exclusions,
+                   "provenance_complete": all(not cls._provenance_unknown(row) for row in rows),
+                   "cache_counts": cache_counts, "questions": question_count,
+                   "cached_questions": cached_count, "question_counts_unknown": counts_unknown,
+                   "selected_models": dict(_jv_collections.Counter(
+                       row["selected_model"] for row in rows if row["selected_model"])),
+                   "primary_models": dict(_jv_collections.Counter(
+                       row["primary_model"] for row in rows if row["primary_model"]))}
+        rows.receipt = summary
+        for row in rows:
+            row["coverage_complete"] = summary["complete"]
+            row["coverage_errors"] = list(coverage_errors)
         cls.stats["runs"].append(summary)
         print(f"jevify: {len(rows)} units · {len(rows) - errors} ok · {errors} errors · "
-              f"models={dict(models)} · primary-priced cost={cost:.6g} · "
+              f"models={dict(models)} · batch cost estimate={cost:.6g} · "
               f"elapsed={elapsed:.1f}s · qhash={digest}")
+        print(_jv_json.dumps({"jevify_receipt": summary}, ensure_ascii=False))
+        if receipt_path is not None:
+            with open(receipt_path, "w", encoding="utf-8") as output:
+                _jv_json.dump(summary, output, indent=2, ensure_ascii=False)
+                output.write("\n")
         return rows
 
-    @staticmethod
-    def _primary(rows):
-        models = _jv_collections.Counter(row.get("model") for row in rows if "error" not in row)
-        return models.most_common(1)[0][0] if models else None
-
     @classmethod
-    def flag(cls, rows, rule=None, *, primary=None):
-        primary = cls._primary(rows) if primary is None else primary
+    def flag(cls, rows, rule=None):
+        """Escalate incomplete coverage independently of answer errors and provenance."""
+        receipt = getattr(rows, "receipt", None)
+        incomplete = receipt is not None and receipt.get("complete") is not True
+        if not rows and (receipt is None or incomplete):
+            raise ValueError("cannot establish coverage for empty rows without a complete run receipt")
         result, counts = [], _jv_collections.Counter()
         for row in rows:
             why = []
             if "error" in row:
                 why.append("error")
             else:
-                if row.get("model") != primary:
-                    why.append(f"fallback:{row.get('model')}")
+                if incomplete or row.get("coverage_complete") is not True:
+                    why.append("coverage_incomplete")
+                if cls._provenance_unknown(row):
+                    why.append("provenance_unknown")
+                if row.get("fallback") is True:
+                    why.append(f"fallback:{row.get('selected_model')}")
                 if rule is not None:
                     reason = rule(row)
                     if reason:
@@ -792,7 +962,10 @@ class jv:
         if limit < 0 or width < 1:
             raise ValueError("limit must be nonnegative and width positive")
         rows = list(rows_or_ids)
-        metadata = {"id", "model", "qhash", "group", "why"}
+        metadata = {"id", "model", "qhash", "group", "slot", "why", "batch_id",
+                    "selected_model", "primary_model", "fallback", "response_model", "cache",
+                    "questions", "cached_questions", "provenance_unknown",
+                    "coverage_complete", "coverage_errors"}
         for entry in rows[:limit]:
             row = entry if isinstance(entry, dict) else {"id": entry}
             identifier = row["id"]
@@ -835,6 +1008,11 @@ class jv:
     @classmethod
     def calibrate(cls, rows, states, Q, *, qid, label, agree=None, per_bin=20,
                   edges=None, model="slow", rubric="", seed=None):
+        """Sample slow opinions using the same states supplied to run().
+
+        Grouped rows select their group/slot while retaining all shared and sibling context.
+        Missing state or slot pairings raise before any opinions are requested.
+        """
         question = Q[qid]
         if question["type"] != "choice" or label not in question["criteria"]:
             raise ValueError("calibrate requires a choice question and one of its labels")
@@ -847,22 +1025,35 @@ class jv:
         rng = _jv_random.Random(cls.SEED if seed is None else seed)
         key = f"{qid}.{label}"
         pools = [[] for _ in range(len(boundaries) - 1)]
-        seen = set()
+        seen, prepared = set(), {}
+        # Validate the entire pairing before the first slow call, not only sampled rows.
         for row in rows:
             uid = row["id"]
-            if "error" in row or uid in seen or uid not in states or key not in row:
+            if "error" in row or uid in seen:
                 continue
             seen.add(uid)
+            state_id = row.get("group", uid)
+            if state_id not in states:
+                raise ValueError(f"calibration state missing for row {uid!r}: {state_id!r}")
+            state, instructions = states[state_id], question["instructions"]
+            if "group" in row or "slot" in row:
+                units = state.get("units") if isinstance(state, dict) else None
+                slot = row.get("slot")
+                if ("group" not in row or not isinstance(units, dict) or not units
+                        or set(units) != {f"s{i}" for i in range(len(units))}
+                        or not isinstance(slot, str) or slot not in units):
+                    raise ValueError(f"invalid grouped calibration state/slot for row {uid!r}")
+                instructions = cls.slot_questions({qid: question}, len(units))[f"{qid}@{slot}"]["instructions"]
+            prepared[uid] = (state, instructions)
+            if key not in row:
+                continue
             p = row[key]
             for index, (lo, hi) in enumerate(zip(boundaries, boundaries[1:])):
                 if lo <= p < hi:
                     pools[index].append((uid, p))
                     break
         chosen = [entry for pool in pools for entry in rng.sample(pool, min(per_bin, len(pool)))]
-        system = "\n\n".join(part for part in (
-            rubric, question["instructions"],
-            "Labels and criteria: " + _jv_json.dumps(question["criteria"], ensure_ascii=False)
-        ) if part)
+        criteria = "Labels and criteria: " + _jv_json.dumps(question["criteria"], ensure_ascii=False)
         schema = {"type": "object", "properties": {
             "verdict": {"enum": list(question["criteria"])}, "reason": {"type": "string"}},
             "required": ["verdict", "reason"]}
@@ -871,9 +1062,11 @@ class jv:
             wave = chosen[start:start + 16]
             handles, submitted = [], []
             for uid, p in wave:
+                state, instructions = prepared[uid]
+                system = "\n\n".join(part for part in (rubric, instructions, criteria) if part)
                 try:
                     handles.append(globals()["completion"](
-                        _jv_json.dumps(states[uid], ensure_ascii=False, default=str),
+                        _jv_json.dumps(state, ensure_ascii=False, default=str),
                         model=model, system=system, schema=schema))
                     submitted.append((uid, p))
                 except Exception as error:
@@ -923,15 +1116,51 @@ class jv:
 
     @staticmethod
     def save(rows, path="/tmp/jevify-rows.jsonl"):
+        """Write a receipt header followed by rows, retaining empty-run coverage evidence."""
         with open(path, "w", encoding="utf-8") as output:
+            output.write(_jv_json.dumps({"jevify_receipt": getattr(rows, "receipt", None)},
+                                       ensure_ascii=False) + "\n")
             for row in rows:
                 output.write(_jv_json.dumps(row, ensure_ascii=False) + "\n")
         return path
 
     @staticmethod
     def load(path):
+        """Restore rows only if their exact inventory and result partition match the receipt."""
         with open(path, encoding="utf-8") as source:
-            return [_jv_json.loads(line) for line in source if line.strip()]
+            records = (_jv_json.loads(line) for line in source if line.strip())
+            header = next(records, None)
+            if not isinstance(header, dict) or set(header) != {"jevify_receipt"}:
+                raise ValueError("saved rows require a jevify_receipt header")
+            receipt = header["jevify_receipt"]
+            if receipt is not None and not isinstance(receipt, dict):
+                raise ValueError("saved run receipt must be an object or null")
+            rows = _JvRows(records, receipt=receipt)
+        if receipt is not None:
+            expected = {}
+            for field in ("unit_ids", "answered_ids", "error_ids"):
+                ids = receipt.get(field)
+                if (not isinstance(ids, list) or any(not isinstance(uid, str) for uid in ids)
+                        or len(set(ids)) != len(ids)):
+                    raise ValueError(f"saved receipt {field} must contain unique string IDs")
+                expected[field] = set(ids)
+            if (expected["answered_ids"] & expected["error_ids"]
+                    or expected["answered_ids"] | expected["error_ids"] != expected["unit_ids"]):
+                raise ValueError("saved receipt success/error IDs do not partition its unit inventory")
+            seen, answered, errors = set(), set(), set()
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                    raise ValueError("saved rows must have string IDs")
+                uid = row["id"]
+                if uid in seen:
+                    raise ValueError(f"duplicate saved row ID: {uid!r}")
+                seen.add(uid)
+                (errors if "error" in row else answered).add(uid)
+            if seen != expected["unit_ids"]:
+                raise ValueError("saved row inventory does not match bound receipt")
+            if answered != expected["answered_ids"] or errors != expected["error_ids"]:
+                raise ValueError("saved row success/error partition does not match bound receipt")
+        return rows
 
     @staticmethod
     def delete_spans(units, ids, *, root=".", dry_run=True):
@@ -988,12 +1217,12 @@ class jv:
     @classmethod
     def report(cls, rows, Q, *, title="jevify"):
         errors = sum("error" in row for row in rows)
-        primary = cls._primary(rows)
-        fallbacks = sum("error" not in row and row.get("model") != primary for row in rows)
+        fallbacks = sum("error" not in row and row.get("fallback") is True for row in rows)
+        unknown = sum("error" not in row and cls._provenance_unknown(row) for row in rows)
         hashes = sorted({row.get("qhash", "<missing>") for row in rows})
         models = _jv_collections.Counter(str(row.get("model")) for row in rows if "error" not in row)
         out = [f"# {title}", "", f"- Units: {len(rows)}; ok: {len(rows) - errors}; "
-               f"errors: {errors}; fallback rows: {fallbacks}.",
+               f"errors: {errors}; fallback rows: {fallbacks}; provenance unknown rows: {unknown}.",
                f"- Question hashes: {', '.join(hashes) if hashes else cls.qhash(Q)}.",
                f"- Models: {dict(models)}."]
         for qid, question in Q.items():
@@ -1007,18 +1236,21 @@ class jv:
             elif question["type"] == "score":
                 out.append(f"- {qid}: mean weighted level index "
                            + (f"{sum(good) / len(good):.2f}" if good else "n/a") + ".")
-        state = cls.stats.get("states", {})
-        if state:
-            out.append(f"- Last states: {state.get('built', 0)} built, "
-                       f"{state.get('dropped', 0)} dropped, "
-                       f"{state.get('truncated', 0)} truncated (cap {state.get('cap')}), "
-                       f"{len(state.get('oversize', []))} over MAX_JEV, "
-                       f"{len(state.get('unmeasured', []))} unmeasured.")
-        if cls.stats.get("runs"):
-            run = cls.stats["runs"][-1]
-            out.append(f"- Last run: {run['units']} units, {run['ok']} ok, "
+        run = getattr(rows, "receipt", None)
+        if run is not None:
+            out.append(f"- Bound run: {run['units']} units, {run['ok']} ok, "
                        f"{run['errors']} errors, models={run['models']}, "
-                       f"primary-priced cost={run['cost']:.6g}, elapsed={run['elapsed']:.1f}s.")
+                       f"batch cost estimate={run['cost']:.6g}, elapsed={run['elapsed']:.1f}s.")
+            out.append(f"- Run coverage complete: {run['complete']}; "
+                       f"cache counts={run['cache_counts']}; host batches={run['batch_ids']}.")
+            out.append(f"- Original units: {len(run['original_ids'])}; "
+                       f"submitted units: {len(run['unit_ids'])}; excluded units: {len(run['excluded_ids'])}.")
+            if run["exclusions"]:
+                out.append(f"- Excluded original IDs and reasons: {run['exclusions']}.")
+            if run["coverage_errors"]:
+                out.append(f"- Coverage errors: {run['coverage_errors']}.")
+        else:
+            out.append("- Run receipt unavailable; no run-level coverage claim.")
         return "\n".join(out) + "\n"
 
 

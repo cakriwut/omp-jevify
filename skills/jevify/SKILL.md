@@ -1,547 +1,85 @@
 ---
 name: jevify
-description: "Use when asked to go through, check, triage or classify every item in a long list and say which ones stand out: every changed hunk or file in a commit or PR (which aren't explained by its message), every call site after a refactor (which still need changing), every log line, compiler diagnostic, review finding or test. Also on the word jevify. Judges each item with the eval kernel's judge_batch (Jev) against questions frozen up front, with %load-able jv helpers. Not for summaries, counts, single-file reviews or plain edits."
+description: "Assess suitability when explicitly asked to use Jev/jevify, or for repeated independent semantic classifications that deterministic tools cannot decide. Choose a method first; neither item count nor loading this skill requires judgment. Not for summaries, counts or plain edits."
 metadata:
-  version: 0.1.4
+  version: 0.2.0
 ---
 
 # Jevify
 
-Rubric first: Jev scores EVERY unit in a complete pass, not repeat-until-no-changes subagent
-sweeps. The orchestrator decides and reads only flagged units; subagents edit, never scan.
-This generalises Can Bölük's Jevict ([thread](https://x.com/_can1357/status/2102524777776677104);
-`skill://jevict` if installed) beyond tests; scores are not proof.
-
-Contents: use · quick path · 0–8 loop · groups · API · facts · recipes A–F · write-time rule · guardrails.
-
-## When to use
-
-- Use for roughly 20+ homogeneous items: changed hunks, migration calls, existing
-  diagnostics, sanitized logs, findings or test units. Below ~20, read them directly.
-- Use a compiler, grep count, ast-grep rule or test instead when it answers deterministically.
-  Cross-unit reasoning needs sibling/group context; otherwise read directly.
-- Measured 2026-09-27 (Opus 5.5, omp 18.3.5, graded evals): on ~30-item tasks and on a
-  12× fixture (340 hunks, 336 findings, 4.8k log lines), direct reading or a short script
-  matched or beat jevify on recall and precision at similar cost; a hunk audit that
-  scripted a rewrite-and-compare check scored 0.96 precision versus 0.52 via jevify.
-  Prefer a script when a rule decides; use jevify when each item needs judgment and no
-  script can decide it, and pilot before trusting it.
-
-## Quick path: read-only answers (do this first)
-
-You loaded this skill for a 20+ item job, so judge the items; do not read them yourself
-first. Reading every item by hand is the failure this skill exists to prevent. For a
-read-only answer ("which of these stand out?"), this is the whole job. Steps 1–8 below
-(pilot, calibration, re-judge) are for deletions, bulk edits or 150+ items.
-
-```python
-%load skill://jevify/jevify.py
-```
-
-```python
-Q = {"verdict": jv.choice(
-    "One changed hunk from a commit. Is it explained by the commit message below?",
-    explained="Every line changed is stated by the message or mechanically follows from it.",
-    mixed="Mostly explained, plus at least one added or changed line the message does not mention.",
-    unexplained="Changes behavior, config or code the message does not mention.",
-    unclear="Cannot tell from the hunk and message alone.")}
-import subprocess  # the full message, not just the title
-msg = subprocess.run(["git", "log", "-1", "--format=%B", "HEAD"], capture_output=True, text=True).stdout
-units = jv.git_units("HEAD", by="hunk")        # or rg_units / ast_units / line_units
-states = jv.states(units, lambda u: {"message": msg, **u})
-rows = await jv.run(states, Q, intent="hunks vs commit message")
-jv.tally(rows, "verdict")
-flagged = jv.flag(rows, lambda r: r["verdict"] != "explained" or r["verdict.explained"] < 0.7)
-jv.show(flagged, states)
-```
-
-Then read each flagged item's source, confirm or overturn it, and answer with the counts
-and the confirmed items. Change only `Q`, the unit source and the render; keep the rest.
-
-## 0. Load the helper
-
-In the Python kernel, `%load` defines `jv` and prints its helper names; `judge_batch`,
-`completion` and `wait` come from the kernel. Re-`%load` resets `jv.frozen`/`jv.stats`.
-Never `%pip`: the kernel Python may lack pip, so `jv.ast_units` installs `ast-grep-py`
-through `jv.dep`. The notice's `wait(judge(...))` example fails here.
-
-```python
-%load skill://jevify/jevify.py
-```
-
-## 1. Decide the rubric before seeing data
-
-Write questions against a concrete contract, before data. Labels are mutually exclusive;
-`UNKNOWN` needs investigation. Fix the 0.7 policy now, not after seeing pilot scores.
-
-```python
-TARGET = "legacyApi"
-paths = ["**/*.ts", "**/*.tsx"]
-SKIP_PREFIX = "generated/"  # deterministic pre-filter; keep both probes aligned
-STATE_CAP = jv.CAP
-Q = {"migration": jv.choice(
-    "For this call site, decide whether it still depends on legacyApi's old behavior. "
-    "A renamed alias or wrapper is not a successful migration; missing context is UNKNOWN.",
-    NEEDS_CHANGE="The old behavior or obsolete contract still reaches a consumer.",
-    SAFE="The call is already migrated or is unrelated despite its name.",
-    UNKNOWN="The available unit cannot prove either conclusion.")}
-ACTION_AT = 0.7
-def need(r):
-    top = max(r.get(f"migration.{k}", 0) for k in ("NEEDS_CHANGE", "SAFE", "UNKNOWN"))
-    if top < ACTION_AT or r.get("migration") == "UNKNOWN": return "uncertain"
-    return "obsolete call" if r.get("migration.NEEDS_CHANGE", 0) >= ACTION_AT else False
-```
-
-## 2. Extract units and check coverage
-
-Use `git_units` for diffs, `rg_units` for hits, `ast_units` for syntax, `line_units`
-for signatures or Jevict's parser for tests. Count naive heads against parser units
-in the same paths; inspect unmapped comments/strings versus real missed calls.
-Equal totals alone prove nothing.
-
-```python
-raw = jv.ast_units(f"{TARGET}($$$ARGS)", lang="typescript", globs=paths)
-units = {k: u for k, u in raw.items() if not u["file"].startswith(SKIP_PREFIX)}
-heads = {k: h for k, h in jv.rg_units(TARGET, fixed=True, globs=paths).items()
-         if not h["file"].startswith(SKIP_PREFIX)}
-print(f"pre-filter removed={len(raw)-len(units)}")
-uncovered = [(h["file"], h["line"]) for h in heads.values() if not any(
-    u["file"] == h["file"] and u["line"] <= h["line"] <= u["end_line"]
-    for u in units.values())]
-print(f"naive={len(heads)} mapped={len(heads)-len(uncovered)} units={len(units)}", uncovered[:20])
-```
-
-## 3. Build states, spot-check extraction
-
-A state is per-unit text/JSON. `jv.states` caps strings and drops empties (one
-rejects a batch); states over `jv.MAX_JEV` Jev tokens (`omp toks`) are warned and
-recorded, since Jev fails them. Inspect boundaries; use `render`
-to attach helpers/siblings when AST call text lacks context (`jv.hunk_states` does
-this for diff hunks).
-
-```python
-states = jv.states(units, cap=STATE_CAP)
-print(f"extracted={len(units)} states={len(states)}", jv.stats["states"])
-jv.show(list(states)[:5], states, width=1200, limit=5)
-```
-
-## 4. Pilot; edit WORDING, not the threshold
-
-Pilot 40–150 units (for 20–39, read all). Read **every** flag and near misses;
-name each misread idiom: helper, span, near-miss, allow-list, transition or duplicate.
-Fix Q's **wording**, never the threshold; rejudge the same pilot for precision/recall.
-Two or three rounds are normal; after five fix extraction/context. Freeze when satisfied.
-
-```python
-pilot = jv.sample(states, n=min(100, len(states)))
-prows = await jv.run(pilot, Q, intent="jevify pilot: migration calls")
-pflags = jv.flag(prows, need)
-jv.show(pflags, pilot, fields=["migration", "migration.NEEDS_CHANGE"],
-        width=STATE_CAP, limit=len(pflags))
-jv.show([r for r in prows if .5 <= r.get("migration.NEEDS_CHANGE", 0) < ACTION_AT], pilot, limit=20)
-```
-
-## 5. Freeze; judge every state
-
-Freeze Q to JSON (12-hex hash), then judge **all** states. The helper drains in
-bounded slices, retries errors/undrained keys once and keeps failures as error rows.
-A post-freeze wording change invalidates every verdict; re-freeze and re-judge all.
-
-```python
-seal = jv.freeze(Q)
-rows = await jv.run(states, Q, intent="jevify: complete migration sweep")
-print(jv.report(rows, Q, title="Migration call-site sweep"))
-```
-
-## 6. Calibrate before bulk or destructive action
-
-Get up to 20 slow-model opinions per choice-probability bin. Agreement should rise
-monotonically to ~100% in the top bin and ≥80% in [0.7, 0.9). Flat bins mean a broken
-state build; top-bin <80% means return to the pilot and re-judge **all**. The threshold
-table estimates true/false flags; empty bins are forward-filled estimates, not proof.
-Calibrate before bulk edits/deletion; optional for read-only reports. No file authority.
-
-```python
-assert not jv.flag(rows), "Resolve failures/fallbacks first"
-cal = jv.calibrate(rows, states, Q, qid="migration", label="NEEDS_CHANGE",
-                   agree={"NEEDS_CHANGE"}, per_bin=20,
-                   rubric="Migration requires consumer-equivalent behavior, not a rename.")
-```
-
-## 7. Escalate exact flagged units and act
-
-`jv.flag` includes errors/fallback models regardless of rule. Read every flagged source
-in full (`jv.show` may truncate), including `UNKNOWN`. Give `task` subagents the exact
-confirmed ID list grouped by file to **edit, never scan**. Do not act on error/fallback
-rows; re-run or read. Deletion needs authority and `jv.delete_spans` dry-run first;
-preserve dirty work. Use LSP references for exported-symbol refactors.
-
-```python
-flags = jv.flag(rows, need)
-jv.show(flags, states, fields=["migration", "migration.NEEDS_CHANGE"], limit=len(flags))
-candidates = {}
-for r in flags:
-    if r["why"] == ["obsolete call"]:
-        candidates.setdefault(units[r["id"]]["file"], []).append(r["id"])
-print("Review before assigning:", candidates)
-```
-
-## 8. Re-extract, re-judge SAME Q, report
-
-After edits, re-extract **and remap naive heads**; re-judge with identical frozen Q.
-Closure needs zero flags/errors/fallbacks/unknowns and no uncovered executable hits.
-Report counts then reviewed IDs: "judge output tuned on an N-unit pilot, calibrated
-on M, not a full read." Zero units is not a model verdict.
-
-```python
-again_raw = jv.ast_units(f"{TARGET}($$$ARGS)", lang="typescript", globs=paths)
-again = {k: u for k, u in again_raw.items() if not u["file"].startswith(SKIP_PREFIX)}
-heads_after = {k: h for k, h in jv.rg_units(TARGET, fixed=True, globs=paths).items()
-               if not h["file"].startswith(SKIP_PREFIX)}
-uncovered_after = [(h["file"], h["line"]) for h in heads_after.values() if not any(
-    u["file"] == h["file"] and u["line"] <= h["line"] <= u["end_line"]
-    for u in again.values())]
-print(f"after: heads={len(heads_after)} units={len(again)} skipped={len(again_raw)-len(again)}", uncovered_after[:20])
-now = jv.states(again)
-post = await jv.run(now, Q, intent="jevify: after action") if now else []
-assert all(r["qhash"] == seal for r in post)
-remaining = jv.flag(post, need)
-print(jv.report(post, Q, title="After action"), f"remaining flags={len(remaining)}")
-assert not remaining, "Flagged units remain; inspect uncovered heads separately"
-```
-
-## Grouped mode: one shared header, multiple per-unit questions
-
-Group independently judgeable units sharing context. `jv.group` chunks by key into
-≤8 slots; `jv.run(..., slots=slots)` returns per-unit rows. The header is billed once:
-eight units with a 3k-character header cost 5.4× less; a real 646-line sweep (1.6k
-header, 111 groups averaging 5.8 units) cost 1.4× less and ran 4× faster. Keep groups
-below `jv.MAX_JEV` tokens; an oversize group fails every slot.
-
-```python
-gstates, slots = jv.group(units, by=lambda u: u["file"], k=8,
-                          render=lambda u: u["text"], shared=lambda file: {"file": file})
-grows = await jv.run(gstates, Q, intent="jevify: grouped call sites", slots=slots)
-gflags = jv.flag(grows, need)
-```
-
-Grouping is a different instrument, not a cheaper copy: on that sweep grouped and flat
-labels agreed 73%, bool P(yes) correlated 0.66, and ≥0.5 flags overlapped 24 of 112;
-a slow tie-break on 16 disagreements sided with flat 6, grouped 7, neither 3. Pilot
-and calibrate grouped rows separately; never mix grouped and flat rows in one decision.
-
-## Helper reference: `jv` (exact public API)
-
-`jv` owns all public names; units are ordered `{id: unit}` with collisions `#2`, `#3`.
-
-| Member / signature | Contract |
-| --- | --- |
-| `jv.CAP = 12_000` | Maximum characters per string field in a state. |
-| `jv.MAX_JEV = 32_000` | Jev-token state ceiling; above it Jev fails `max_tokens_exceeded`. |
-| `jv.SEED = 11` | Default deterministic sampling seed. |
-| `jv.EDGES = (0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.01)` | Default left-closed probability bins. |
-| `jv.stats = {"states": {...}, "runs": [...]}` | Built-state and run statistics. |
-| `jv.frozen = None \| qhash` | Last frozen question hash. |
-| `jv.choice(instructions, criteria=None, **labels) -> dict` | Choice question; at least two labels via dict or kwargs. |
-| `jv.yes(instructions, *, true=None, false=None) -> dict` | Bool question; optional explicit criteria. |
-| `jv.scale(instructions, *levels) -> dict` | Score question; ≥2 levels, lowest to highest. |
-| `jv.qhash(Q) -> str` | First 12 hex of SHA-256 of sorted-key JSON questions. |
-| `jv.freeze(Q, path="/tmp/jevify-questions.json") -> str` | Write Q as JSON, set `jv.frozen`, return qhash. |
-| `jv.git_units(rev, *, by="file"\|"hunk", cwd=".", paths=None, context=3)` | Diff range `A..B`/`A...B`, `WORKTREE`, `STAGED`, or single commit (merges vs first parent). |
-| `jv.rg_units(pattern, *, cwd=".", globs=None, context=3, fixed=False, case=True, max_units=50_000)` | `rg --json -n -C`, no stdin; no matches `{}`, over cap raises. |
-| `jv.ast_units(pattern=None, *, lang, rule=None, cwd=".", globs=None)` | Exactly one ast-grep pattern or rule dict (`kind`/`regex`/`has`/`inside`/`any`/`not`); installs via `jv.dep`. |
-| `jv.dep(dist, module=None) -> module` | Import; else `uv pip install --target $XDG_CACHE_HOME/jevify/pyX.Y` (pip fallback), then import. |
-| `jv.line_units(source, *, keep=None, drop=None, normalize=True, examples=3)` | Path/text/lines → grouped normalized signature counts. |
-| `jv.states(units, render=None, *, cap=None) -> {id: state}` | Render str/dict, recursive cap; drop empty; Jev-measure states over `MAX_JEV` UTF-8 bytes (8 threads); warn/record `oversize`/`unmeasured` ids and counts. |
-| `jv.jev_tokens(text, *, timeout=20) -> int \| None` | `omp toks --json` Jev count; None if omp missing, timed out or unparsable. |
-| `jv.hunk_states(units, *, siblings=6, users=3, width=700, cap=None)` | Hunk states plus nearest same-file hunks by line distance and hunks using names it defines. |
-| `jv.group(units, *, by, k=8, render=None, shared=None, cap=None) -> (gstates, slots)` | Shared state, ≤k per group; slots map gid to original ids. |
-| `jv.sample(states, n=60, *, seed=None) -> dict` | Sorted ids, seeded random subset. |
-| `await jv.run(states, Q, *, intent, concurrency=32, retries=1, timeout=1800, slots=None) -> list[row]` | Drain/retry failures once, except `max_tokens_exceeded` (error `oversize: …`); flat rows, grouped expansion when slots given. |
-| `jv.slot_questions(Q, k) -> dict` | Copy Q into per-slot `qid@sN` questions; absent slots discarded. |
-| `jv.flag(rows, rule=None, *, primary=None) -> list[row]` | Copies with `why`; always errors and `fallback:<model>` (non-modal judge candidate), plus truthy rule. |
-| `jv.show(rows_or_ids, states, *, fields=None, width=1200, limit=30)` | Print verdict fields and state, truncate to width. |
-| `jv.tally(rows, key, *, edges=None) -> dict` | Counts labels or numeric histogram; prints table. |
-| `jv.calibrate(rows, states, Q, *, qid, label, agree=None, per_bin=20, edges=None, model="slow", rubric="", seed=None) -> dict` | Slow choice agreement and threshold estimates. |
-| `jv.save(rows, path="/tmp/jevify-rows.jsonl") -> path` | Persist flat JSONL rows. |
-| `jv.load(path) -> rows` | Recover JSONL rows. |
-| `jv.delete_spans(units, ids, *, root=".", dry_run=True) -> {file: lines_removed}` | Merge spans; remove bottom-up, plus one trailing blank line. |
-| `jv.report(rows, Q, *, title="jevify") -> str` | Markdown counts, model/qhash, label distribution, state/run summaries. |
-
-`git_units`: no-color/no-ext-diff, paths after `--`; file id `path` →
-`{file,status,diff}`, hunk id `path:+NEW_START` (or `-OLD_START`) →
-`{file,status,header,hunk,line,old_line}`; binary/rename/mode-only → `path:meta`.
-`rg_units`: explicit `.` and DEVNULL stdin; `path:line` → `{file,line,match,context}`.
-`ast_units`: `rg --files`, `path:line` → `{file,line,end_line,text}` (1-based); `.tsx`/`.jsx`
-parse as tsx/jsx and files with parse errors are still searched. A `def`/`function` pattern
-starts at the keyword (decorators excluded) and also matches nested definitions; use a
-`rule` (recipe F) for deletable spans.
-`hunk_states`: `{file,status,hunk,nearest_sibling_hunks,hunks_using_names_defined_here}`;
-users come from names defined at the hunk's outermost indentation, dunders excluded.
-`line_units`: UUID/hex/timestamp/number-normalized `sha1(signature)[:10]` →
-`{signature,count,examples}`, most frequent first.
-
-| `jv.run` flat row field | Meaning |
-| --- | --- |
-| `id: str` | Original unit id; stable for this extraction. |
-| `model: str \| None` | Per-item answering model, never assume batch status model. |
-| `qhash: str` | First 12 hex of questions hash. |
-| `error: str` | Present **only** on failure; never turn into a safe label. |
-| `group: str` | Present only for a grouped row; group-state id. |
-| `row[q]` for choice `q` | Chosen label. |
-| `row[f"{q}.{label}"]` | P(label) for **every** choice label. |
-| `row[f"{q}.conf"]` for choice | Choice confidence. |
-| `row[q]` for bool `q` | P(yes), a float, not a Python boolean verdict. |
-| `row[q]` for score `q` | Probability-weighted **level index**, not 0–1 probability. |
-| `row[f"{q}.conf"]` for score | Score confidence. |
-
-`jv.flag` infers modal primary; string rule results label `why`, other truthy values
-become `"rule"`, error rows skip the rule. `jv.calibrate` returns `{bins,thresholds,
-verdicts}` with `verdicts[id]={slow,reason,p}`; slow errors are `ERR`, excluded from
-agreement. `jv.delete_spans` requires inclusive 1-based `{file,line,end_line}`;
-missing ids are reported and dry-run is the default.
-
-## Harness facts (measured 2026-09-27 on omp 18.3.4, typesafe/jev-1.13.0)
-
-- `judge(state, questions)` is a coroutine: `await judge(...)` returns answers;
-  `wait([judge(...)])` raises `TypeError`. The built-in jevify notice's `wait(handles)`
-  example fails on this build; use `jv.run`/`judge_batch` for bulk work.
-- `judge_batch(states, questions, *, concurrency=None, retries=None, min_ok=None,
-  intent=None)` has `id,intent,total,status(),drain(timeout),drain_iter(timeout),
-  results(),failed(),cancel(),close()`. Status: `{id,intent,total,done,failed,cost,
-  running,model,elapsedS}`; item: `{key,ok,answers,error,model}`. Choice returns
-  `{type,choice,confidence,probabilities}`, bool `{type,bool: P(yes)}`, score
-  `{type,score,confidence,legend,probabilities}` (weighted level **index**).
-- One empty `""` state rejects the **entire batch at submit**. Jev state ceiling ≈33k
-  Jev tokens: 32,086/32,595 judged; 33,101/34,107 failed. Chars mislead: prose ≈0.2
-  tok/char (130k ok, 200k failed), dense ≈0.72 (30k ok, 60k failed), CJK/emoji ≈2.
-  Oversize fails **per item**: `ok=False`, `model=None`, `error` ends `API error (400):
-  …max_tokens_exceeded`. Since 18.3.0 judgment falls back only to native candidates,
-  never the chat model; status has one model, so per-item `item.model` names the route.
-- `omp toks <file> --json` counts one input (several paths concatenate); pick
-  `encoding == "Jev"`. ~0.25 s on real text (312 KB diff 0.3 s), but 50k repeats of one
-  character took ~30 s: always set a timeout.
-- State cost ~$0.03–0.05/M tokens (~$0.01/M ordinary chars, ~$0.04/M dense);
-  questions are cheap. Can Bölük reported ~$2 for 27k tests; not a guarantee.
-- `completion(prompt, *, model="default"|"smol"|"slow", system=None, schema=None)`
-  returns `id,kind,status,done,wait,cancel`; schema makes `.wait()` return a dict.
-  `wait([...], raise_errors=False)` supports handles. One slow call took ~6 s.
-- The kernel runs system Python 3.12 without pip: `%pip install` fails with
-  `No module named pip`. `jv.dep` installed `ast-grep-py` via uv into the cache dir in
-  ~1 s. Present: `rg`, git, `uv`; absent: numpy, matplotlib, tree-sitter.
-  `%load skill://jevify/jevify.py` also resolves skills created mid-session.
-- Stability: re-judging 100 hunks with the identical frozen Q flipped 0 labels
-  (median |ΔP| 0, max 0.07), yet 5 rows crossed the 0.7 uncertainty line. Churn at
-  the threshold is noise, not wording drift.
-- Throughput here: 646 flat states in 5.4 s (~120/s, $0.025); 100 hunks in ~1 s ($0.006).
-  `jv.calibrate` ran 21 slow calls in 20 s (waves of 16).
-
-## Recipes: source, complete question, escalation, action
-
-Freeze Q before data; escalate top P<0.7, ambiguous bools (0.3–0.7), failures/fallbacks and named labels; labels grant no authority.
-
-### A. Diff scope audit (commit, PR, branch, or worktree)
-
-Source: `jv.git_units(rev, by='hunk')` (keep binary/meta units) and the **full**
-commit message or PR body as the boundary, not its title. Give every declared purpose
-an operational label (what its hunks look like) plus `undeclared` and `mixed`. Render
-with `jv.hunk_states`: a setup, helper or parametrization hunk serves the purpose its
-tests assert, which only neighbouring hunks reveal.
-
-```python
-import subprocess
-REV = "HEAD"  # or 'origin/main...HEAD' with MESSAGE from `gh pr view --json body`
-MESSAGE = subprocess.run(["git", "log", "-1", "--format=%B", REV],
-                         capture_output=True, text=True, check=True).stdout
-Q = {"purpose": jv.choice(
-    "Assign THIS hunk to the declared purpose it serves. Sibling hunks and hunks using names "
-    "it defines are context: helpers, fixtures and parametrizations serve the purpose their "
-    "tests assert; a change's own proposal/tasks/metadata serve that change.\n"
-    f"MESSAGE:\n{MESSAGE}",
-    feature="<declared purpose 1, operationally: its code, tests, docs and reporting>",
-    validation_repair="<declared repair: formatter blank lines, type-narrowing asserts, mock fixes>",
-    undeclared="Serves none of the declared purposes.",
-    mixed="Separable changes serving different purposes, including an undeclared one."),
-    "behaviour_undeclared": jv.yes(
-        "Does this hunk change runtime (non-test) behavior for a reason OTHER than the declared "
-        "purposes? A behavior change that implements a declared purpose answers no."),
-    "debug_leftover": jv.yes("Does this hunk add debug output, commented-out code or TODOs?")}
-units = jv.git_units(REV, by="hunk")
-states = jv.hunk_states(units)
-```
-
-Escalate `undeclared`/`mixed`, top label P < 0.7, either bool ≥ 0.5 and errors/fallbacks;
-read every flag in full. Measured on a 100-hunk, three-purpose commit: a title-only
-in/out-of-scope rubric flagged 41–42 hunks (declared fixture repairs, a package upgrade,
-change metadata); declared purposes plus `hunk_states` flagged 21–24. A double-negative
-behaviour question sat at P≈0.5 on 7 core hunks until reworded as above. Fast
-`undeclared` at P 0.5–0.9 matched the slow model on 1 of 6; the slow model matched hand
-reading on 8 of 8 reviewed flags, leaving one truly undeclared spec reflow. Preserve user
-work, repair authorized scope, re-extract against the same base and re-judge SAME Q.
-
-### B. Refactor or migration call-site completeness
-
-Source: LSP references first for exports; `rg_units` or `ast_units` plus a naive
-grep count. Include aliases/wrappers; syntax matches alone cannot prove completeness.
-
-```python
-Q = {"migration": jv.choice(
-    "Classify THIS call against the new API contract; a rename alone is not migration.",
-    migrated="New contract used with equivalent consumer-visible behavior.",
-    needs_change="Obsolete contract or lost required behavior remains reachable.",
-    not_applicable="Lookalike hit not governed by this migration.",
-    unsure="Alias, type or surrounding context is insufficient.")}
-units = jv.ast_units("oldApi($$$ARGS)", lang="typescript")
-```
-
-Escalate `migration.needs_change ≥ 0.7`, `unsure`, errors/fallbacks; read consumers.
-Fan confirmed IDs by file for edits; re-extract/re-judge SAME Q to zero residual heads.
-
-### C. Existing compiler/diagnostic output triage
-
-Source: parse **captured** tsc/eslint/cargo output into one unit per diagnostic
-`{file,line,code,message,context}`. Preserve the location and neighboring source;
-`line_units` alone groups away locations. Example below parses tsc; adapt the parser
-for eslint/cargo, without running diagnostics solely for this sweep.
-
-```python
-import re
-from pathlib import Path
-Q = {"origin": jv.choice(
-    "Classify immediate cause, not a downstream cascade; use source context.",
-    real_bug="Changed source has an observable defect needing repair.",
-    type_only="Type-check contract fails, without evidence of a runtime failure.",
-    stale_or_generated="Diagnostic comes from stale build state or generated output.",
-    noise="Non-actionable, duplicate, or source context insufficient to decide."),
-    "effort": jv.scale("Estimated repair effort given this source context?",
-                       "local", "multi-file", "architecture")}
-rx = re.compile(r"^(.*)\((\d+),\d+\): error (TS\d+): (.*)$")
-lines = Path("/tmp/diagnostics.log").read_text().splitlines()
-def context(p, n):
-    f = Path(p)
-    if not f.is_file(): return ""
-    source = f.read_text(errors="replace").splitlines()
-    return "\n".join(source[max(0, int(n)-3):int(n)+2])
-units = {f"{p}:{n}:{code}:{i}": {"file": p, "line": int(n), "code": code,
-         "message": msg, "context": context(p, n)} for i, line in enumerate(lines)
-         if (m := rx.match(line)) for p, n, code, msg in [m.groups()]}
-```
-
-Escalate `real_bug`/`type_only`, ambiguous `noise`, high effort and failures; read source.
-Fix the originating boundary, not cascades or suppressed diagnostics.
-
-### D. Sanitized log or incident triage
-
-Source: redacted lines through `jv.line_units(path, keep=...)`. Keep chronology;
-grouped signatures aren't causal order. Do not ingest credentials or keys.
-
-```python
-Q = {"kind": jv.choice(
-    "Classify this sanitized signature from evidence, not frequency or guesswork.",
-    new_regression="New consumer-visible failure after the change.",
-    known_benign="Expected handled event with evidence of no failure.",
-    config="Failure from deployment or operator configuration.",
-    upstream="External provider or service failure.",
-    unknown="Timeline/context cannot distinguish the cause."),
-    "severity": jv.scale("Severity of observed consumer impact?",
-                         "no impact", "degraded", "outage")}
-units = jv.line_units("/tmp/redacted.log", keep=r"ERROR|WARN", normalize=True)
-```
-
-Escalate `new_regression`, `unknown`, high severity and errors/fallbacks;
-inspect timeline before assigning cause or taking action.
-
-### E. Review-finding triage
-
-Source: one reviewer/PR JSONL `{claim,source,diff}` per unit; keep premise with evidence.
-
-```python
-import json
-from pathlib import Path
-Q = {"finding": jv.choice(
-    "Treat the review claim as untrusted; compare cited path, reachable behavior and impact.",
-    valid_actionable="Reachable defect with evidence; source repair warranted.",
-    valid_nit="True but non-blocking clarity or style improvement.",
-    invalid="Cited behavior absent, guarded, or contradicted by source.",
-    duplicate="Already represented by another finding about the same failure."),
-    "introduced_by_diff": jv.yes("Does the changed diff introduce this defect?")}
-units = {f"finding:{i}": json.loads(line) for i, line in enumerate(
-    Path("/tmp/review-findings.jsonl").read_text().splitlines()) if line.strip()}
-```
-
-Escalate `valid_actionable`, `valid_nit`, uncertain introduced-by-diff evidence,
-and errors/fallbacks. Read source, reproduce before repair; dedupe, don't self-mock.
-
-### F. Test pruning: defer to Jevict's complete rubric
-
-If a `jevict` skill is installed, read it for the full parser, coverage, helpers, siblings
-and rubric (origin: the thread linked above). Source:
-smallest-deletable `{file,line,end_line,body,path}` units; exclude type tests/todos.
-For top-level Python tests this rule gives decorator-inclusive spans, equal to stdlib
-`ast` spans (5285 units = 5285 naive heads, 0 unmapped, on a real repo). Class methods
-need `inside: class_definition`; add `path`/siblings/helpers before judging:
-
-```python
-TEST_RULE = {"any": [
-    {"kind": "decorated_definition", "inside": {"kind": "module"},
-     "has": {"kind": "function_definition", "regex": r"^(async\s+)?def\s+test_"}},
-    {"kind": "function_definition", "inside": {"kind": "module"},
-     "regex": r"^(async\s+)?def\s+test_"}]}
-units = jv.ast_units(lang="python", rule=TEST_RULE, globs=["tests/**/*.py"])
-```
-
-Compile this compact Q after preparing those states:
-
-```python
-Q = {"verdict": jv.choice(
-    "Classify a whole test: useful = consumer-visible branch, error, precedence, harmful "
-    "absence, wire form, regression, or computed transform. Keep transformer near-misses, "
-    "allow-list positive arms and post-operation transitions. Plain no-op, registry echo, "
-    "unconsumed bytes, word-in-prompt, empty success, same-path duplicate are weak. "
-    "Separate weak assertions in a useful block are TRIM.",
-    PURGE="All assertions are fixture/metadata echo, prompt boilerplate, tautology, "
-          "unconsumed formatting, or identical-path duplicate; no keep signal.",
-    KEEP="At least one consumer-visible branch/error/precedence/negative/wire/regression "
-         "or computed transformation, with no separable purge-only assertion.",
-    TRIM="At least one useful assertion and a separable purge-only assertion; retain the unit.")}
-```
-
-Escalate `verdict.PURGE ≥ 0.7`, TRIM, errors/fallbacks; read each purge and calibrate.
-With deletion authority dry-run `jv.delete_spans(units, ids, dry_run=True)` (verified on
-a copy: file untouched, unknown ids reported; the real run removed exactly the chosen
-tests with their decorators and left other decorators intact), inspect spans,
-apply confirmed deletions, hand-edit TRIM, re-extract/re-judge SAME Q. Assertion helpers
-count; an absent keyword alone isn't grounds to delete.
-
-## Promote to a write-time rule
-
-When requested, write `<repo>/.omp/rules/test-value.md` or
-`~/.omp/agent/rules/test-value.md`: one yes/no question, gated by `scope`/`condition`.
-
-```markdown
----
-description: Warn when a changed test asserts only incidental implementation details
-question: Does this test edit add assertions that only echo fixtures, inspect wiring, or check successful completion without pinning a plausible consumer-visible failure?
-scope: "tool:edit(*.test.ts), tool:write(*.test.ts)"
-condition: "expect\\(|assert"
----
-Read the test: replace incidental assertions with a consumer contract, or remove them; preserve useful assertions.
-```
-
-TTSR judges `{output,content}` (≤60k chars) **after** completion, never interrupts.
-P(yes) ≥ 0.7 delivers the body as a hidden warning; failure delivers nothing.
-`ttsr.judge: auto` requires native TypeSafe Jev. Optional `globs`, regex `condition`
-or ast-grep `astCondition` gate cost; scopes include `text`, `thinking`, `tool` and
-`tool:<name>(<glob>)`. `omp ttsr list` shows questions; `omp ttsr test/scan`
-do not exercise the judge. `/omfg` drafts rules; rules do not replace bulk sweeps.
-
-## Guardrails and handoff
-
-- Rubric first; cover extraction before judgment; read flagged source, not just scores.
-  Choice probability is not correctness; scale scores are weighted level indices.
-- Preserve Q's hash across full/after-action runs; any wording change means re-judge all.
-  Inspect errors and fallback rows; never turn them into automatic edits.
-- Calibrate before bulk/destructive action, inspect disagreements and dry-run spans.
-  Review authority is not deletion authority. Never stash, reset, commit or touch unrelated work.
-- Report counts first: extracted/covered, dropped/truncated, piloted/judged, errors,
-  models, flags, calibration, changed/remaining; separate estimates from reviewed source.
+Jev is an optional classifier, not evidence of correctness or permission to edit.
+An explicit Jev request still needs a suitability decision; explain a better method
+when deterministic tools or direct reading answer the actual question more reliably.
+
+## Choose the method
+
+- Prefer a compiler, search, AST rule or short script when a rule decides the answer.
+- Prefer direct reading for small jobs or tightly cross-dependent reasoning.
+- Consider Jev for repeated, independently judgeable semantic decisions with the
+  necessary shared context. Repetition or list length alone is not a reason to use it.
+- Loading this skill or its helper does not require a judge call. If choosing Jev,
+  pilot before relying on results, including for read-only answers.
+
+Optional Python helper: `%load skill://jevify/jevify.py`.
+Read [the on-demand reference](skill://jevify/reference.md) only for needed helper
+APIs, extraction details or existing recipes; it is not a second mandatory workflow.
+
+## If choosing Jev
+
+1. Declare the question, source scope and unit boundaries. Define mutually exclusive
+   labels, including uncertainty, against a concrete contract before judging data.
+   Set escalation/action thresholds before the pilot; do not tune them to obtain
+   desired outcomes. Scores and threshold estimates are not correctness guarantees.
+   Default escalation: top choice probability below 0.7, unknown labels, and bool
+   probabilities in 0.3–0.7; name additional flag labels in the rubric up front.
+2. Check extraction coverage and context. Map independent source hits to units;
+   matching totals alone do not prove coverage. Account for filters, dropped/empty
+   states, truncation and oversize inputs. Include relevant helpers, siblings and
+   consumers; sanitize logs and never submit credentials or keys.
+3. Pilot the chosen representation. Read flagged sources and near misses, compare
+   verdicts with evidence, and repair misread wording or missing context. Rejudge the
+   pilot after changes; abandon Jev if the judgments remain unsuitable.
+4. Freeze the rubric/questions and preserve their hash for full and after-action
+   runs. A post-freeze wording change invalidates prior verdicts: re-freeze and
+   rejudge the affected declared sweep, not just the flags.
+5. When doing a sweep, judge every unit in the declared scope and reconcile every
+   missing result, including originals dropped before grouping. A pilot is not
+   complete coverage. Check the run's bound receipt as well as row flags; an empty
+   flag list cannot prove completeness. Retain errors, fallback routes and unknowns
+   as unresolved, never as safe labels; rerun or inspect their sources.
+6. Persist the frozen questions/hash, source-to-unit mapping, rendered states and
+   group slots, batch IDs, returned rows and receipt before discarding evidence.
+   Host batch attachment can recover a surviving batch after a kernel reset, not
+   resume an interrupted `jv.run` coroutine; see the reference for cursor and cleanup
+   limits.
+
+## Confirm before action
+
+- Read every flagged source in full, not just a truncated render or score; confirm
+  or overturn the claim from reachable behavior and the governing contract.
+  Escalate uncertainty, near-threshold ambiguity, errors, explicit fallback rows
+  and unknown provenance. Stock OMP 18.8.7 does not expose the route/cache fields
+  needed to resolve provenance; a familiar model label is not a substitute.
+- Calibrate before bulk edits or destructive action; read-only calibration is
+  optional. Model agreement is an estimate, not source confirmation or authority.
+  Poor agreement calls for revisiting the pilot/context, not relaxing thresholds.
+- Grouping is a separate instrument, not an interchangeable cheaper flat run.
+  Pilot grouped judgments separately; calibrate them separately before bulk or
+  destructive action. Do not mix grouped and flat rows in one decision.
+- Act only on confirmed items within granted authority. Review authority is not
+  deletion authority. Dry-run deletable spans, preserve dirty/unrelated work, and
+  use LSP references for exported-symbol refactors. Delegate exact confirmed IDs
+  for edits rather than asking editors to rediscover candidates.
+- After edits, re-extract and remap coverage, then rejudge with the same frozen
+  questions. Unresolved flags/errors/unknowns or uncovered hits prevent a clean
+  closure claim. Receipt completeness is independent of row flags and source
+  coverage; a zero-unit extraction is not a model verdict.
+
+## Report honestly
+
+Report the chosen method and declared scope; extracted/covered, dropped/truncated,
+piloted/judged and manually reviewed counts; errors, models/fallbacks, flags,
+calibration if performed, receipt completeness, and changed/remaining items.
+Separate judge estimates from source-confirmed conclusions. Say when the result is
+pilot-tuned or sampled, not a full read; do not claim complete coverage or successful
+action without evidence.
