@@ -21,6 +21,9 @@ action; read-only calibration is optional. Scores and model agreement are not pr
 permission to edit. It generalises Can Bölük's Jevict
 ([thread](https://x.com/_can1357/status/2102524777776677104)) beyond test pruning.
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the component diagram, maintenance locations,
+and a grounded synthetic rubric example.
+
 ## Install
 
 ```sh
